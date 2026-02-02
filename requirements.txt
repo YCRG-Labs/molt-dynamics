@@ -1,0 +1,52 @@
+# Molt Dynamics Analysis - Pinned Dependencies
+# Python 3.11 required
+
+# Data manipulation and analysis
+pandas==2.1.4
+numpy==1.26.3
+pyarrow==14.0.2
+
+# Network analysis
+networkx==3.2.1
+
+# Machine learning and clustering
+scikit-learn==1.4.0
+
+# Scientific computing and statistics
+scipy==1.11.4
+statsmodels==0.14.1
+
+# Visualization
+matplotlib==3.8.2
+seaborn==0.13.1
+
+# Property-based testing
+hypothesis==6.92.1
+
+# Database (legacy - not used with JSON storage)
+psycopg2-binary==2.9.9
+
+# Data loading
+pyarrow==14.0.2
+
+# NLP and sentiment analysis
+vaderSentiment==3.3.2
+
+# Environment configuration
+python-dotenv==1.0.0
+
+# Topic modeling
+gensim==4.3.2
+
+# Survival analysis
+lifelines==0.27.8
+
+# Power-law testing
+powerlaw==1.5
+
+# Testing
+pytest==7.4.4
+pytest-cov==4.1.0
+
+# Type hints
+typing-extensions==4.9.0

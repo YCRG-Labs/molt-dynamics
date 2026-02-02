@@ -1,0 +1,32 @@
+# Molt Dynamics Analysis - Default Configuration
+# Override these values in config/local.yaml or via command-line arguments
+
+# Analysis parameters (matching paper specifications)
+random_seed: 42
+lda_topics: 20
+kmeans_k_range: [3, 8]
+kmeans_n_init: 100
+pagerank_damping: 0.85
+bootstrap_iterations: 1000
+significance_level: 0.05
+
+# Cascade identification
+min_cascade_adopters: 5
+ngram_range: [2, 5]
+
+# Collaboration identification
+min_collab_agents: 3
+min_collab_comments: 5
+min_collab_duration_minutes: 30
+
+# Phase transition binning
+network_size_bins: [50, 100, 200, 500, 1000, 2000, 5000]
+
+# Output settings
+figure_dpi: 300
+output_dir: output
+figure_formats: [png, pdf]
+
+# Logging
+log_file: molt_analysis.log
+log_level: INFO
