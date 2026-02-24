@@ -73,6 +73,10 @@ class JSONStorage:
         self._interactions: list[dict] = []
         self._submolts: dict[str, dict] = {}
         self._memberships: dict[str, dict] = {}
+        
+        # Indexes for fast lookups
+        self._posts_by_author: dict[str, list[str]] = {}
+        self._comments_by_author: dict[str, list[str]] = {}
     
     def connect(self) -> None:
         """Initialize storage directory and load existing data."""
@@ -93,6 +97,9 @@ class JSONStorage:
         self._interactions = self._load_json("interactions.json", [])
         self._submolts = self._load_json("submolts.json", {})
         self._memberships = self._load_json("memberships.json", {})
+        
+        # Build indexes for fast author lookups
+        self._build_author_indexes()
     
     def _save_all(self) -> None:
         """Save all data to JSON files."""
@@ -102,6 +109,27 @@ class JSONStorage:
         self._save_json("interactions.json", self._interactions)
         self._save_json("submolts.json", self._submolts)
         self._save_json("memberships.json", self._memberships)
+    
+    def _build_author_indexes(self) -> None:
+        """Build indexes for fast author-based lookups."""
+        self._posts_by_author = {}
+        self._comments_by_author = {}
+        
+        for post_id, data in self._posts.items():
+            author_id = data.get('author_id')
+            if author_id:
+                if author_id not in self._posts_by_author:
+                    self._posts_by_author[author_id] = []
+                self._posts_by_author[author_id].append(post_id)
+        
+        for comment_id, data in self._comments.items():
+            author_id = data.get('author_id')
+            if author_id:
+                if author_id not in self._comments_by_author:
+                    self._comments_by_author[author_id] = []
+                self._comments_by_author[author_id].append(comment_id)
+        
+        logger.info(f"Built author indexes: {len(self._posts_by_author)} post authors, {len(self._comments_by_author)} comment authors")
     
     def _load_json(self, filename: str, default: Any) -> Any:
         """Load data from a JSON file."""
@@ -115,13 +143,18 @@ class JSONStorage:
         return default
     
     def _save_json(self, filename: str, data: Any) -> None:
-        """Save data to a JSON file."""
+        """Save data to a JSON file atomically."""
         filepath = self.data_dir / filename
+        temp_filepath = self.data_dir / f".{filename}.tmp"
         try:
-            with open(filepath, 'w', encoding='utf-8') as f:
+            with open(temp_filepath, 'w', encoding='utf-8') as f:
                 json.dump(data, f, cls=DateTimeEncoder, indent=2)
+            # Atomic rename - if this fails, original file is intact
+            temp_filepath.replace(filepath)
         except IOError as e:
             logger.error(f"Failed to save {filename}: {e}")
+            if temp_filepath.exists():
+                temp_filepath.unlink()
     
     def initialize_schema(self) -> None:
         """Initialize empty data structures (no-op for JSON storage)."""
@@ -258,6 +291,13 @@ class JSONStorage:
             'scraped_at': (post.scraped_at or datetime.now()).isoformat(),
         }
         
+        # Update author index for fast lookups
+        if anon_author_id:
+            if anon_author_id not in self._posts_by_author:
+                self._posts_by_author[anon_author_id] = []
+            if post.post_id not in self._posts_by_author[anon_author_id]:
+                self._posts_by_author[anon_author_id].append(post.post_id)
+        
         # Update agent-submolt membership
         if post.submolt and anon_author_id:
             self._update_membership(anon_author_id, post.submolt, post.created_at)
@@ -274,6 +314,27 @@ class JSONStorage:
             List of Post objects.
         """
         posts = []
+        
+        # Use author index for fast lookup if filtering by author_id only
+        if filters and "author_id" in filters and len(filters) == 1:
+            author_id = filters["author_id"]
+            post_ids = self._posts_by_author.get(author_id, [])
+            for post_id in post_ids:
+                data = self._posts.get(post_id)
+                if data:
+                    posts.append(Post(
+                        post_id=data['post_id'],
+                        author_id=data.get('author_id', ''),
+                        title=data.get('title', ''),
+                        body=data.get('body', ''),
+                        submolt=data.get('submolt', ''),
+                        upvotes=data.get('upvotes', 0),
+                        downvotes=data.get('downvotes', 0),
+                        created_at=parse_datetime(data.get('created_at')),
+                        scraped_at=parse_datetime(data.get('scraped_at')),
+                    ))
+            posts.sort(key=lambda p: p.created_at or datetime.min)
+            return posts
         
         for data in self._posts.values():
             # Apply filters
@@ -333,6 +394,13 @@ class JSONStorage:
             'scraped_at': (comment.scraped_at or datetime.now()).isoformat(),
         }
         
+        # Update author index for fast lookups
+        if anon_author_id:
+            if anon_author_id not in self._comments_by_author:
+                self._comments_by_author[anon_author_id] = []
+            if comment.comment_id not in self._comments_by_author[anon_author_id]:
+                self._comments_by_author[anon_author_id].append(comment.comment_id)
+        
         return comment.comment_id
     
     def get_comments(self, filters: Optional[dict] = None) -> list[Comment]:
@@ -345,6 +413,27 @@ class JSONStorage:
             List of Comment objects.
         """
         comments = []
+        
+        # Use author index for fast lookup if filtering by author_id only
+        if filters and "author_id" in filters and len(filters) == 1:
+            author_id = filters["author_id"]
+            comment_ids = self._comments_by_author.get(author_id, [])
+            for comment_id in comment_ids:
+                data = self._comments.get(comment_id)
+                if data:
+                    comments.append(Comment(
+                        comment_id=data['comment_id'],
+                        post_id=data.get('post_id', ''),
+                        author_id=data.get('author_id', ''),
+                        parent_comment_id=data.get('parent_comment_id'),
+                        body=data.get('body', ''),
+                        upvotes=data.get('upvotes', 0),
+                        downvotes=data.get('downvotes', 0),
+                        created_at=parse_datetime(data.get('created_at')),
+                        scraped_at=parse_datetime(data.get('scraped_at')),
+                    ))
+            comments.sort(key=lambda c: c.created_at or datetime.min)
+            return comments
         
         for data in self._comments.values():
             # Apply filters

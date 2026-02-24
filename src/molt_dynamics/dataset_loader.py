@@ -262,6 +262,7 @@ class MoltBookDatasetLoader:
         Returns:
             Number of agents loaded.
         """
+        
         logger.info("Loading agents from dataset...")
         count = 0
         
@@ -407,6 +408,7 @@ class MoltBookDatasetLoader:
             "agents": 0,
             "posts": 0,
             "comments": 0,
+            "interactions": 0,
             "start_time": start_time.isoformat(),
         }
         
@@ -415,6 +417,9 @@ class MoltBookDatasetLoader:
         results["agents"] = self.load_agents(max_agents)
         results["posts"] = self.load_posts(max_posts)
         results["comments"] = self.load_comments(max_comments)
+        
+        # Extract interactions from comment relationships
+        results["interactions"] = self._extract_interactions()
         
         # Save to disk
         self.storage.save()
@@ -425,3 +430,61 @@ class MoltBookDatasetLoader:
         
         logger.info(f"Dataset loading complete: {results}")
         return results
+    
+    def _extract_interactions(self) -> int:
+        """Extract interactions from comment relationships.
+        
+        Creates interactions for:
+        1. Comment replies: commenter → parent comment author
+        2. Post comments: commenter → post author
+        
+        Returns:
+            Number of interactions extracted.
+        """
+        from .models import Interaction
+        
+        logger.info("Extracting interactions from comments...")
+        count = 0
+        
+        comments = self.storage.get_comments()
+        
+        for comment in comments:
+            source_id = comment.author_id
+            if not source_id:
+                continue
+            
+            # Type 1: Reply to another comment
+            if comment.parent_comment_id:
+                parent_author = self.storage.get_comment_author(comment.parent_comment_id)
+                if parent_author and parent_author != source_id:
+                    interaction = Interaction(
+                        source_agent_id=source_id,
+                        target_agent_id=parent_author,
+                        interaction_type='comment_reply',
+                        post_id=comment.post_id,
+                        comment_id=comment.comment_id,
+                        timestamp=comment.created_at,
+                    )
+                    self.storage.insert_interaction(interaction)
+                    count += 1
+            
+            # Type 2: Comment on a post (only if not a reply to another comment)
+            else:
+                post_author = self.storage.get_post_author(comment.post_id)
+                if post_author and post_author != source_id:
+                    interaction = Interaction(
+                        source_agent_id=source_id,
+                        target_agent_id=post_author,
+                        interaction_type='post_comment',
+                        post_id=comment.post_id,
+                        comment_id=comment.comment_id,
+                        timestamp=comment.created_at,
+                    )
+                    self.storage.insert_interaction(interaction)
+                    count += 1
+            
+            if count % 5000 == 0 and count > 0:
+                logger.info(f"Extracted {count} interactions...")
+        
+        logger.info(f"Extracted {count} interactions from comments")
+        return count

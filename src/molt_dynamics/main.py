@@ -17,9 +17,7 @@ from .dataset_loader import MoltBookDatasetLoader
 from .network import NetworkBuilder
 from .features import FeatureExtractor, TopicModeler
 from .rq1_roles import RoleAnalyzer
-from .rq2_diffusion import CascadeIdentifier, DiffusionModeler, CascadeAnalyzer
-from .rq3_collaboration import CollaborationIdentifier, SolutionAssessor
-from .rq4_phase import OrderParameterCalculator, PhaseAnalyzer
+from .rq3_collaboration import CollaborationIdentifier
 from .validation import StatisticalFramework, RobustnessChecker
 from .output import OutputGenerator
 
@@ -103,13 +101,14 @@ def run_rq1_analysis(features_std, config: Config) -> dict:
     # Classify roles
     roles = analyzer.classify_roles()
     
-    # Generate visualization
-    analyzer.plot_role_clusters(f"{config.output_dir}/role_clusters.png")
+    # Save all data instead of just generating visualization
+    saved_files = analyzer.save_all_data(config.output_dir)
     
     return {
         'optimal_k': optimal_k,
         'silhouette_scores': silhouette_scores,
         'role_distribution': roles.value_counts().to_dict(),
+        'saved_files': saved_files,
     }
 
 
@@ -117,30 +116,19 @@ def run_rq2_analysis(storage: JSONStorage, network, config: Config) -> dict:
     """RQ2: Information diffusion analysis."""
     logger.info("Running RQ2: Information diffusion analysis...")
     
-    identifier = CascadeIdentifier(storage, config)
+    from .rq2_diffusion import save_rq2_data
     
-    # Identify cascades
-    meme_cascades = identifier.identify_meme_cascades()
-    skill_cascades = identifier.identify_skill_cascades()
-    behavioral_cascades = identifier.identify_behavioral_cascades()
+    # Save all RQ2 data
+    saved_files = save_rq2_data(storage, network, config, config.output_dir)
     
-    all_cascades = meme_cascades + skill_cascades + behavioral_cascades
-    
-    # Analyze cascades
-    analyzer = CascadeAnalyzer(all_cascades)
-    stats = analyzer.compute_cascade_statistics()
-    power_law = analyzer.test_power_law()
-    
-    # Model diffusion
-    modeler = DiffusionModeler(all_cascades, network)
-    contagion_type = modeler.test_contagion_type()
+    # Load summary for return value
+    import json
+    with open(f"{config.output_dir}/rq2_summary.json", 'r') as f:
+        summary = json.load(f)
     
     return {
-        'n_meme_cascades': len(meme_cascades),
-        'n_skill_cascades': len(skill_cascades),
-        'n_behavioral_cascades': len(behavioral_cascades),
-        'power_law_alpha': power_law.get('alpha'),
-        'contagion_type': contagion_type,
+        **summary,
+        'saved_files': saved_files,
     }
 
 
@@ -148,46 +136,19 @@ def run_rq3_analysis(storage: JSONStorage, network, config: Config) -> dict:
     """RQ3: Collective problem-solving analysis."""
     logger.info("Running RQ3: Collective problem-solving analysis...")
     
-    identifier = CollaborationIdentifier(storage, config)
-    events = identifier.identify_collaborative_events()
+    from .rq3_collaboration import save_rq3_data
     
-    # Assess solutions
-    assessor = SolutionAssessor(config)
-    for event in events:
-        if event.solution:
-            assessment = assessor.assess_code_solution(event.solution)
-            event.quality_score = assessment.get('quality_score', 0)
+    # Save all RQ3 data
+    saved_files = save_rq3_data(storage, network, config, config.output_dir)
     
-    return {
-        'n_collaborative_events': len(events),
-        'avg_participants': np.mean([len(e.participants) for e in events]) if events else 0,
-        'avg_quality_score': np.mean([e.quality_score for e in events if e.quality_score]) if events else 0,
-    }
-
-
-def run_rq4_analysis(events, features, config: Config) -> dict:
-    """RQ4: Phase transition analysis."""
-    logger.info("Running RQ4: Phase transition analysis...")
-    
-    calculator = OrderParameterCalculator(events, features)
-    order_params = calculator.compute_order_parameters_by_size()
-    
-    analyzer = PhaseAnalyzer(order_params, config)
-    
-    # Identify critical point
-    Nc, ci = analyzer.identify_critical_point()
-    
-    # Finite-size scaling
-    scaling = analyzer.perform_finite_size_scaling()
-    
-    # Generate visualization
-    analyzer.plot_phase_transition(f"{config.output_dir}/phase_transition.png")
+    # Load summary for return value
+    import json
+    with open(f"{config.output_dir}/rq3_summary.json", 'r') as f:
+        summary = json.load(f)
     
     return {
-        'critical_point_Nc': Nc,
-        'confidence_interval': ci,
-        'gamma': scaling.get('gamma'),
-        'nu': scaling.get('nu'),
+        **summary,
+        'saved_files': saved_files,
     }
 
 
@@ -234,7 +195,7 @@ def main():
                         help='Path to cloned dataset repository')
     parser.add_argument('--skip-loading', action='store_true',
                         help='Skip data loading phase (use existing data)')
-    parser.add_argument('--rq', type=str, nargs='+', choices=['1', '2', '3', '4', 'all'],
+    parser.add_argument('--rq', type=str, nargs='+', choices=['1', '2', '3', 'all'],
                         default=['all'], help='Research questions to analyze')
     
     args = parser.parse_args()
@@ -266,7 +227,7 @@ def main():
         features, features_std = run_feature_extraction(storage, network, config)
         
         results = {}
-        rqs = args.rq if 'all' not in args.rq else ['1', '2', '3', '4']
+        rqs = args.rq if 'all' not in args.rq else ['1', '2', '3']
         
         # Run analyses
         if '1' in rqs:
@@ -277,12 +238,6 @@ def main():
         
         if '3' in rqs:
             results['rq3'] = run_rq3_analysis(storage, network, config)
-        
-        if '4' in rqs:
-            # Need collaborative events from RQ3
-            identifier = CollaborationIdentifier(storage, config)
-            events = identifier.identify_collaborative_events()
-            results['rq4'] = run_rq4_analysis(events, features, config)
         
         # Validation
         results['validation'] = run_validation(storage, features, config)

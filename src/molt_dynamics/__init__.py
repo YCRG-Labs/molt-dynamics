@@ -14,7 +14,6 @@ from .features import FeatureExtractor, TopicModeler
 from .rq1_roles import RoleAnalyzer
 from .rq2_diffusion import CascadeIdentifier, DiffusionModeler, CascadeAnalyzer
 from .rq3_collaboration import CollaborationIdentifier, SolutionAssessor
-from .rq4_phase import OrderParameterCalculator, PhaseAnalyzer
 from .validation import StatisticalFramework, RobustnessChecker
 from .output import OutputGenerator
 
@@ -32,8 +31,6 @@ __all__ = [
     'CascadeAnalyzer',
     'CollaborationIdentifier',
     'SolutionAssessor',
-    'OrderParameterCalculator',
-    'PhaseAnalyzer',
     'StatisticalFramework',
     'RobustnessChecker',
     'OutputGenerator',

@@ -207,4 +207,8 @@ marimo/_lsp/
 __marimo__/
 
 /paper/
+/old/
 /output/
+src/output/
+*.log
+moltbook-observatory-archive/

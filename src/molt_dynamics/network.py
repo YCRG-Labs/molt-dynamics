@@ -94,6 +94,8 @@ class NetworkBuilder:
         self,
         until_time: Optional[datetime] = None,
         directed: bool = True,
+        min_edge_weight: int = 1,
+        max_agents_per_submolt: Optional[int] = None,
     ) -> nx.DiGraph | nx.Graph:
         """Build network from co-posting relationships in submolts.
         
@@ -103,6 +105,9 @@ class NetworkBuilder:
         Args:
             until_time: Optional cutoff time for temporal snapshot.
             directed: If True, return directed graph; otherwise undirected.
+            min_edge_weight: Minimum co-posting count to include edge (default 1).
+                            Set higher (e.g., 2) to reduce edge count significantly.
+            max_agents_per_submolt: Cap agents per submolt to limit O(n²) explosion.
             
         Returns:
             NetworkX graph with agents as nodes and co-posting as edges.

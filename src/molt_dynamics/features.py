@@ -349,17 +349,38 @@ class FeatureExtractor:
             logger.warning("No agents found in database")
             return pd.DataFrame()
         
-        features_list = []
+        # Pre-compute network metrics once (these are already cached but let's be explicit)
+        logger.info("Pre-computing network centrality metrics...")
+        if self._pagerank_cache is None:
+            self._pagerank_cache = nx.pagerank(
+                self.network, 
+                alpha=self.config.pagerank_damping
+            )
+        if self._betweenness_cache is None:
+            self._betweenness_cache = nx.betweenness_centrality(self.network)
+        if self._clustering_cache is None:
+            undirected = self.network.to_undirected()
+            self._clustering_cache = nx.clustering(undirected)
         
-        for agent in agents:
+        features_list = []
+        total_agents = len(agents)
+        
+        for idx, agent in enumerate(agents):
+            if idx % 500 == 0:
+                logger.info(f"Processing agent {idx + 1}/{total_agents}")
+            
             agent_id = agent.agent_id
             
-            # Compute all feature groups
-            activity = self.compute_activity_metrics(agent_id)
-            topic_entropy, normalized_entropy = self.compute_topic_diversity(agent_id)
-            centrality = self.compute_centrality_metrics(agent_id)
-            temporal = self.compute_temporal_features(agent_id)
-            content = self.compute_content_features(agent_id)
+            # Fetch posts and comments ONCE per agent
+            posts = self.storage.get_posts(filters={'author_id': agent_id})
+            comments = self.storage.get_comments(filters={'author_id': agent_id})
+            
+            # Compute all features using pre-fetched data
+            activity = self._compute_activity_from_data(posts, comments)
+            topic_entropy, normalized_entropy = self._compute_topic_diversity_from_data(posts)
+            centrality = self._compute_centrality_from_cache(agent_id)
+            temporal = self._compute_temporal_from_data(posts, comments)
+            content = self._compute_content_from_data(posts, comments)
             
             # Combine into single dict
             features = {
@@ -383,6 +404,209 @@ class FeatureExtractor:
         logger.info(f"Extracted features for {len(df)} agents")
         
         return df
+    
+    def _compute_activity_from_data(self, posts: list, comments: list) -> dict:
+        """Compute activity metrics from pre-fetched data."""
+        total_posts = len(posts)
+        total_comments = len(comments)
+        
+        if total_comments > 0:
+            post_comment_ratio = total_posts / total_comments
+        else:
+            post_comment_ratio = float(total_posts) if total_posts > 0 else 0.0
+        
+        timestamps = []
+        for post in posts:
+            if post.created_at:
+                timestamps.append(post.created_at)
+        for comment in comments:
+            if comment.created_at:
+                timestamps.append(comment.created_at)
+        
+        if len(timestamps) >= 2:
+            active_lifespan = (max(timestamps) - min(timestamps)).total_seconds() / 86400
+        else:
+            active_lifespan = 0.0
+        
+        if active_lifespan > 0:
+            posts_per_day = total_posts / active_lifespan
+        else:
+            posts_per_day = float(total_posts)
+        
+        return {
+            'total_posts': total_posts,
+            'total_comments': total_comments,
+            'post_comment_ratio': post_comment_ratio,
+            'active_lifespan_days': active_lifespan,
+            'posts_per_day': posts_per_day,
+        }
+    
+    def _compute_topic_diversity_from_data(self, posts: list) -> tuple[float, float]:
+        """Compute topic diversity from pre-fetched posts."""
+        if not posts:
+            return 0.0, 0.0
+        
+        submolt_counts = Counter(post.submolt for post in posts if post.submolt)
+        
+        if not submolt_counts:
+            return 0.0, 0.0
+        
+        total = sum(submolt_counts.values())
+        
+        entropy = 0.0
+        for count in submolt_counts.values():
+            p = count / total
+            if p > 0:
+                entropy -= p * math.log2(p)
+        
+        max_entropy = math.log2(len(submolt_counts)) if len(submolt_counts) > 1 else 1.0
+        normalized = entropy / max_entropy if max_entropy > 0 else 0.0
+        
+        return entropy, normalized
+    
+    def _compute_centrality_from_cache(self, agent_id: str) -> dict:
+        """Compute centrality metrics using pre-computed caches."""
+        if agent_id not in self.network:
+            return {
+                'in_degree': 0,
+                'out_degree': 0,
+                'betweenness': 0.0,
+                'clustering_coefficient': 0.0,
+                'pagerank': 0.0,
+            }
+        
+        return {
+            'in_degree': self.network.in_degree(agent_id),
+            'out_degree': self.network.out_degree(agent_id),
+            'betweenness': self._betweenness_cache.get(agent_id, 0.0),
+            'clustering_coefficient': self._clustering_cache.get(agent_id, 0.0),
+            'pagerank': self._pagerank_cache.get(agent_id, 0.0),
+        }
+    
+    def _compute_temporal_from_data(self, posts: list, comments: list) -> dict:
+        """Compute temporal features from pre-fetched data."""
+        timestamps = []
+        for post in posts:
+            if post.created_at:
+                timestamps.append(post.created_at)
+        for comment in comments:
+            if comment.created_at:
+                timestamps.append(comment.created_at)
+        
+        if not timestamps:
+            return {
+                'hour_distribution': np.zeros(24),
+                'autocorrelation': 0.0,
+                'burst_coefficient': 0.0,
+            }
+        
+        hour_counts = np.zeros(24)
+        for ts in timestamps:
+            hour_counts[ts.hour] += 1
+        
+        total = hour_counts.sum()
+        if total > 0:
+            hour_distribution = hour_counts / total
+        else:
+            hour_distribution = hour_counts
+        
+        autocorrelation = 0.0
+        if len(timestamps) >= 3:
+            timestamps_sorted = sorted(timestamps)
+            inter_times = [
+                (timestamps_sorted[i+1] - timestamps_sorted[i]).total_seconds()
+                for i in range(len(timestamps_sorted) - 1)
+            ]
+            if len(inter_times) >= 2 and np.std(inter_times) > 0:
+                autocorrelation = np.corrcoef(inter_times[:-1], inter_times[1:])[0, 1]
+                if np.isnan(autocorrelation):
+                    autocorrelation = 0.0
+        
+        burst_coefficient = 0.0
+        if len(timestamps) >= 2:
+            timestamps_sorted = sorted(timestamps)
+            inter_times = [
+                (timestamps_sorted[i+1] - timestamps_sorted[i]).total_seconds()
+                for i in range(len(timestamps_sorted) - 1)
+            ]
+            mean_inter = np.mean(inter_times)
+            std_inter = np.std(inter_times)
+            if mean_inter > 0:
+                burst_coefficient = std_inter / mean_inter
+        
+        return {
+            'hour_distribution': hour_distribution,
+            'autocorrelation': autocorrelation,
+            'burst_coefficient': burst_coefficient,
+        }
+    
+    def _compute_content_from_data(self, posts: list, comments: list) -> dict:
+        """Compute content features from pre-fetched data."""
+        texts = []
+        for post in posts:
+            if post.body:
+                texts.append(post.body)
+            if post.title:
+                texts.append(post.title)
+        for comment in comments:
+            if comment.body:
+                texts.append(comment.body)
+        
+        if not texts:
+            return {
+                'avg_post_length': 0.0,
+                'vocabulary_diversity': 0.0,
+                'avg_sentiment': 0.0,
+                'technical_density': 0.0,
+            }
+        
+        avg_length = np.mean([len(t) for t in texts])
+        
+        all_words = ' '.join(texts).lower().split()
+        if all_words:
+            unique_words = set(all_words)
+            vocabulary_diversity = len(unique_words) / len(all_words)
+        else:
+            vocabulary_diversity = 0.0
+        
+        # Sentiment analysis - initialize analyzer once
+        if not hasattr(self, '_sentiment_analyzer'):
+            try:
+                from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
+                self._sentiment_analyzer = SentimentIntensityAnalyzer()
+            except ImportError:
+                self._sentiment_analyzer = None
+        
+        if self._sentiment_analyzer:
+            sentiments = [self._sentiment_analyzer.polarity_scores(t)['compound'] for t in texts]
+            avg_sentiment = np.mean(sentiments)
+        else:
+            avg_sentiment = 0.0
+        
+        technical_keywords = {
+            'function', 'class', 'method', 'variable', 'parameter', 'return',
+            'import', 'module', 'package', 'library', 'api', 'endpoint',
+            'database', 'query', 'schema', 'table', 'index', 'key',
+            'algorithm', 'data', 'structure', 'array', 'list', 'dict',
+            'loop', 'condition', 'if', 'else', 'for', 'while', 'try',
+            'error', 'exception', 'debug', 'test', 'unit', 'integration',
+            'deploy', 'server', 'client', 'request', 'response', 'http',
+            'json', 'xml', 'html', 'css', 'javascript', 'python', 'java',
+            'code', 'script', 'compile', 'runtime', 'memory', 'cpu',
+        }
+        
+        if all_words:
+            technical_count = sum(1 for w in all_words if w in technical_keywords)
+            technical_density = technical_count / len(all_words)
+        else:
+            technical_density = 0.0
+        
+        return {
+            'avg_post_length': avg_length,
+            'vocabulary_diversity': vocabulary_diversity,
+            'avg_sentiment': avg_sentiment,
+            'technical_density': technical_density,
+        }
     
     def standardize_features(
         self, 

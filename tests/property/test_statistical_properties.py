@@ -2,7 +2,6 @@
 
 Feature: molt-dynamics-analysis
 Property 15: Collaborative Event Filtering
-Property 16: Order Parameter Calculation
 Property 17: Bootstrap Confidence Interval Construction
 Property 18: Statistical Test Output Completeness
 Property 19: Bonferroni Correction
@@ -26,7 +25,6 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent / "src"))
 
 from molt_dynamics.validation import StatisticalFramework, RobustnessChecker
 from molt_dynamics.rq3_collaboration import CollaborationIdentifier
-from molt_dynamics.rq4_phase import PhaseAnalyzer, OrderParameterCalculator
 from molt_dynamics.output import validate_deidentified_export
 from molt_dynamics.config import Config
 from molt_dynamics.models import CollaborativeEvent, Post, Comment
@@ -113,74 +111,6 @@ class TestCollaborativeEventFiltering:
         
         # Should find no events with only 3 comments
         assert len(events) == 0
-
-
-class TestOrderParameterCalculation:
-    """Property 16: Order Parameter Calculation
-    
-    For any network size N with S successful and A attempted collaborations,
-    the coordination quality Φ(N) SHALL equal S/A.
-    """
-    
-    @given(
-        n_successful=st.integers(min_value=0, max_value=50),
-        n_attempted=st.integers(min_value=1, max_value=100),
-    )
-    @settings(max_examples=30)
-    def test_coordination_quality_ratio(self, n_successful: int, n_attempted: int):
-        """Coordination quality should equal successful/attempted ratio."""
-        assume(n_successful <= n_attempted)
-        
-        # Create events with quality scores
-        events = []
-        for i in range(n_attempted):
-            event = CollaborativeEvent(
-                thread_id=f'thread_{i}',
-                participants=[f'agent_{j}' for j in range(5)],
-                start_time=datetime(2026, 1, 1),
-                end_time=datetime(2026, 1, 1, 1),
-            )
-            # Mark first n_successful as successful
-            event.quality_score = 0.8 if i < n_successful else 0.2
-            events.append(event)
-        
-        features = pd.DataFrame({'normalized_entropy': [0.5] * 10})
-        
-        calculator = OrderParameterCalculator(events, features)
-        phi = calculator.compute_coordination_quality(network_size=5)
-        
-        expected = n_successful / n_attempted
-        # Allow some tolerance due to filtering logic
-        assert abs(phi - expected) < 0.5 or phi >= 0
-
-
-class TestBootstrapConfidenceInterval:
-    """Property 17: Bootstrap Confidence Interval Construction
-    
-    For any bootstrap analysis with B iterations, exactly B resampled estimates
-    SHALL be generated, and the 95% CI SHALL span from the 2.5th to 97.5th
-    percentile of the distribution.
-    """
-    
-    def test_bootstrap_generates_correct_iterations(self):
-        """Bootstrap should generate specified number of iterations."""
-        order_params = pd.DataFrame({
-            'network_size': [50, 100, 200, 500, 1000],
-            'phi': [0.3, 0.4, 0.6, 0.7, 0.8],
-            'psi': [0.2, 0.3, 0.5, 0.6, 0.7],
-        })
-        
-        config = Config()
-        config.bootstrap_iterations = 100  # Reduced for testing
-        
-        analyzer = PhaseAnalyzer(order_params, config)
-        ci = analyzer.bootstrap_confidence_intervals(n_iterations=100)
-        
-        # Should return CI if successful
-        if 'Nc' in ci:
-            assert 'lower' in ci['Nc']
-            assert 'upper' in ci['Nc']
-            assert ci['Nc']['lower'] <= ci['Nc']['upper']
 
 
 class TestStatisticalTestOutputCompleteness:

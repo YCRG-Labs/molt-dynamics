@@ -35,6 +35,9 @@ class Config:
     bootstrap_iterations: int = 1000
     significance_level: float = 0.05
     
+    # Parallelization (-1 = use all CPUs)
+    n_jobs: int = -1
+    
     # Cascade identification
     min_cascade_adopters: int = 5
     ngram_range: tuple[int, int] = (2, 5)
