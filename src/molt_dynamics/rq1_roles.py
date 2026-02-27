@@ -13,6 +13,7 @@ import logging
 from pathlib import Path
 from typing import Optional
 
+import inspect
 import numpy as np
 import pandas as pd
 from joblib import Parallel, delayed
@@ -520,12 +521,19 @@ class RoleAnalyzer:
         else:
             X = self._full_matrix
         
-        tsne = TSNE(
-            n_components=2,
-            perplexity=min(perplexity, len(X) - 1),
-            max_iter=max_iter,
-            random_state=self.config.random_seed,
-        )
+        tsne_kwargs = {
+            'n_components': 2,
+            'perplexity': min(perplexity, len(X) - 1),
+            'random_state': self.config.random_seed,
+        }
+        tsne_init_params = inspect.signature(TSNE.__init__).parameters
+        if 'max_iter' in tsne_init_params:
+            tsne_kwargs['max_iter'] = max_iter
+        else:
+            # Older scikit-learn uses n_iter instead of max_iter
+            tsne_kwargs['n_iter'] = max_iter
+
+        tsne = TSNE(**tsne_kwargs)
         self._tsne_embedding = tsne.fit_transform(X)
         
         logger.info(f"[{feature_set}] Computed t-SNE embedding with shape {self._tsne_embedding.shape}")
