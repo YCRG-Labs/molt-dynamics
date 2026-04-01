@@ -10,7 +10,7 @@ pyarrow==14.0.2
 networkx==3.2.1
 
 # Machine learning and clustering
-scikit-learn==1.4.0
+scikit-learn==1.6.1
 
 # Scientific computing and statistics
 scipy==1.11.4
@@ -27,7 +27,6 @@ hypothesis==6.92.1
 psycopg2-binary==2.9.9
 
 # Data loading
-pyarrow==14.0.2
 
 # NLP and sentiment analysis
 vaderSentiment==3.3.2
