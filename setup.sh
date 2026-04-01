@@ -44,10 +44,12 @@ mkdir -p output
 echo "[6/6] Running analysis pipeline..."
 python -m molt_dynamics \
     --config config/default.yaml \
-    --dataset-path moltbook-observatory-archive
+    --dataset-path moltbook-observatory-archive \
+    --rq all
 
 echo ""
 echo "=== Done! Results are in output/ ==="
+echo ""
 echo "To re-run without reloading data:"
 echo "  source .venv/bin/activate"
-echo "  python -m molt_dynamics --skip-loading"
+echo "  python -m molt_dynamics --skip-loading --rq all"
