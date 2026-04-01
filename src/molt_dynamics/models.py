@@ -123,6 +123,28 @@ class Cascade:
 
 
 @dataclass
+class ComplexityFeatures:
+    """Complexity proxy features for a thread's seed post."""
+    thread_id: str
+    seed_word_count: int
+    technical_keyword_density: float
+    code_block_present: bool
+
+
+@dataclass
+class HubEmergenceEvent:
+    """Tracks when an agent first enters a hub cluster."""
+    agent_id: str
+    emergence_date: Optional[datetime]  # None if right-censored
+    emerged: bool
+    time_to_emergence_days: float  # observation time if censored
+    join_cohort: str  # 'day1-3', 'day4-7', 'later'
+    initial_posting_cadence: float
+    submolt_diversity_day3: int
+    early_reply: bool
+
+
+@dataclass
 class CollaborativeEvent:
     """A collaborative problem-solving event."""
     thread_id: str
@@ -132,3 +154,24 @@ class CollaborativeEvent:
     problem_statement: str = ""
     solution: str = ""
     quality_score: Optional[float] = None
+
+
+@dataclass
+class PropagationNode:
+    """A node in a cascade propagation tree."""
+    agent_id: str
+    adoption_time: datetime
+    depth: int
+    parent_agent_id: Optional[str]
+    role_cluster: Optional[str]
+
+
+@dataclass
+class VocabularyTerm:
+    """A novel term that emerged from a specific thread."""
+    term: str
+    source_thread_id: str
+    first_appearance: datetime
+    adoption_count: int
+    adopting_thread_ids: list[str]
+    time_to_first_spread_hours: Optional[float]

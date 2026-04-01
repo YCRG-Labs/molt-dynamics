@@ -18,7 +18,10 @@ from scipy import stats
 
 from .storage import JSONStorage
 from .config import Config
-from .models import CollaborativeEvent
+from sklearn.neighbors import NearestNeighbors
+from sklearn.preprocessing import StandardScaler
+
+from .models import CollaborativeEvent, ComplexityFeatures
 
 logger = logging.getLogger(__name__)
 
@@ -127,6 +130,245 @@ class CollaborationIdentifier:
                 technical_ids.append(post.post_id)
         
         return technical_ids
+
+
+class ComplexityMatcher:
+    """Computes complexity proxy features and performs nearest-neighbor matching."""
+
+    def __init__(self, storage: JSONStorage, config: Config) -> None:
+        self.storage = storage
+        self.config = config
+
+    def compute_complexity_features(self, thread_id: str) -> dict:
+        """Compute seed_word_count, technical_keyword_density, code_block_present
+        for a thread's seed post.
+
+        Args:
+            thread_id: The post_id of the thread's seed post.
+
+        Returns:
+            Dict with thread_id, seed_word_count, technical_keyword_density,
+            code_block_present.
+        """
+        # Direct lookup from internal store for efficiency
+        post_data = self.storage._posts.get(thread_id)
+        if post_data:
+            body = post_data.get("body", "")
+        else:
+            body = ""
+
+        words = body.split()
+        seed_word_count = max(len(words), 1)
+
+        # Technical keyword density: fraction of words that are technical keywords
+        if words:
+            tech_count = sum(
+                1 for w in words if w.lower().strip(".,!?;:()[]{}\"'") in TECHNICAL_KEYWORDS
+            )
+            technical_keyword_density = tech_count / len(words)
+        else:
+            technical_keyword_density = 0.0
+
+        # Code block presence: check for ``` fenced blocks or indented code patterns
+        code_block_present = bool(
+            "```" in body
+            or re.search(r"(?m)^    \S", body)
+            or re.search(r"(?m)^\t\S", body)
+        )
+
+        return {
+            "thread_id": thread_id,
+            "seed_word_count": seed_word_count,
+            "technical_keyword_density": technical_keyword_density,
+            "code_block_present": code_block_present,
+        }
+
+    def _get_thread_timing(self, thread_id: str) -> float:
+        """Get thread creation timestamp as a float (seconds since epoch).
+
+        Returns 0.0 if no timestamp is available.
+        """
+        post_data = self.storage._posts.get(thread_id)
+        if post_data:
+            from .storage import parse_datetime
+
+            created = parse_datetime(post_data.get("created_at"))
+            if created:
+                return created.timestamp()
+        return 0.0
+
+    def _get_thread_topic(self, thread_id: str) -> str:
+        """Get the submolt (topic) of a thread. Returns '' if unknown."""
+        post_data = self.storage._posts.get(thread_id)
+        if post_data:
+            return post_data.get("submolt", "")
+        return ""
+
+    def _build_feature_matrix(self, thread_ids: list[str]) -> np.ndarray:
+        """Build a feature matrix for a list of threads.
+
+        Features: seed_word_count, technical_keyword_density, code_block_present,
+        topic_hash (numeric encoding of submolt), timing (epoch seconds).
+
+        Returns:
+            2D numpy array of shape (len(thread_ids), 5).
+        """
+        rows = []
+        for tid in thread_ids:
+            cf = self.compute_complexity_features(tid)
+            timing = self._get_thread_timing(tid)
+            topic = self._get_thread_topic(tid)
+            # Encode topic as a numeric hash for distance computation
+            topic_num = hash(topic) % (2**16)
+            rows.append([
+                cf["seed_word_count"],
+                cf["technical_keyword_density"],
+                float(cf["code_block_present"]),
+                topic_num,
+                timing,
+            ])
+        return np.array(rows, dtype=float)
+
+    def match_with_complexity(
+        self,
+        collaborative_threads: list[str],
+        candidate_threads: list[str],
+        ratio: str = "1:1",
+        replacement: bool = False,
+    ) -> pd.DataFrame:
+        """1:1 nearest-neighbor matching on complexity + topic + timing features.
+
+        Args:
+            collaborative_threads: Thread IDs identified as collaborative.
+            candidate_threads: Candidate (non-collaborative) thread IDs.
+            ratio: Matching ratio, currently only '1:1' supported.
+            replacement: Whether to sample with replacement.
+
+        Returns:
+            DataFrame with columns: collaborative_thread, matched_thread, distance.
+        """
+        output_dir = Path(self.config.output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        if not collaborative_threads or not candidate_threads:
+            empty_df = pd.DataFrame(
+                columns=["collaborative_thread", "matched_thread", "distance"]
+            )
+            self._write_outputs(empty_df, collaborative_threads, candidate_threads, ratio, replacement, output_dir)
+            return empty_df
+
+        # Build feature matrices
+        collab_features = self._build_feature_matrix(collaborative_threads)
+        candidate_features = self._build_feature_matrix(candidate_threads)
+
+        # Standardize features jointly
+        all_features = np.vstack([collab_features, candidate_features])
+        scaler = StandardScaler()
+        scaler.fit(all_features)
+        collab_scaled = scaler.transform(collab_features)
+        candidate_scaled = scaler.transform(candidate_features)
+
+        # Nearest-neighbor matching
+        n_neighbors = 1
+        nn = NearestNeighbors(n_neighbors=n_neighbors, metric="euclidean")
+        nn.fit(candidate_scaled)
+        distances, indices = nn.kneighbors(collab_scaled)
+
+        matched_pairs = []
+        used_candidates = set()
+
+        if replacement:
+            # With replacement: each collaborative thread gets its nearest neighbor
+            for i, collab_tid in enumerate(collaborative_threads):
+                cand_idx = indices[i, 0]
+                matched_pairs.append({
+                    "collaborative_thread": collab_tid,
+                    "matched_thread": candidate_threads[cand_idx],
+                    "distance": float(distances[i, 0]),
+                })
+        else:
+            # Without replacement: greedy assignment by distance
+            # Sort all (collab_idx, cand_idx, distance) by distance
+            assignments = []
+            for i in range(len(collaborative_threads)):
+                assignments.append((i, indices[i, 0], distances[i, 0]))
+            assignments.sort(key=lambda x: x[2])
+
+            matched_collab = set()
+            for collab_idx, cand_idx, dist in assignments:
+                if collab_idx in matched_collab:
+                    continue
+                if cand_idx in used_candidates:
+                    continue
+                matched_pairs.append({
+                    "collaborative_thread": collaborative_threads[collab_idx],
+                    "matched_thread": candidate_threads[cand_idx],
+                    "distance": float(dist),
+                })
+                matched_collab.add(collab_idx)
+                used_candidates.add(cand_idx)
+
+            # For any unmatched collaborative threads, find next-best unused candidate
+            if len(matched_pairs) < len(collaborative_threads):
+                # Re-fit with more neighbors to find alternatives
+                k = min(len(candidate_threads), len(collaborative_threads))
+                nn_full = NearestNeighbors(n_neighbors=k, metric="euclidean")
+                nn_full.fit(candidate_scaled)
+                distances_full, indices_full = nn_full.kneighbors(collab_scaled)
+
+                for i, collab_tid in enumerate(collaborative_threads):
+                    if i in matched_collab:
+                        continue
+                    for j in range(k):
+                        cand_idx = indices_full[i, j]
+                        if cand_idx not in used_candidates:
+                            matched_pairs.append({
+                                "collaborative_thread": collab_tid,
+                                "matched_thread": candidate_threads[cand_idx],
+                                "distance": float(distances_full[i, j]),
+                            })
+                            matched_collab.add(i)
+                            used_candidates.add(cand_idx)
+                            break
+
+        result_df = pd.DataFrame(matched_pairs)
+        self._write_outputs(result_df, collaborative_threads, candidate_threads, ratio, replacement, output_dir)
+        return result_df
+
+    def _write_outputs(
+        self,
+        result_df: pd.DataFrame,
+        collaborative_threads: list[str],
+        candidate_threads: list[str],
+        ratio: str,
+        replacement: bool,
+        output_dir: Path,
+    ) -> None:
+        """Write matched baseline and metadata JSON files."""
+        # Write matched baseline
+        baseline_data = {
+            "matched_pairs": result_df.to_dict(orient="records") if not result_df.empty else [],
+            "n_matched": len(result_df),
+        }
+        with open(output_dir / "rq3_complexity_matched_baseline.json", "w") as f:
+            json.dump(baseline_data, f, indent=2)
+
+        # Write matching metadata
+        final_n = len(result_df)
+        metadata = {
+            "matching_ratio": ratio,
+            "replacement_flag": replacement,
+            "final_n": final_n,
+            "n_collaborative": len(collaborative_threads),
+            "n_candidates": len(candidate_threads),
+        }
+        with open(output_dir / "rq3_matching_metadata.json", "w") as f:
+            json.dump(metadata, f, indent=2)
+
+        logger.info(
+            f"Complexity matching: {final_n} pairs matched "
+            f"(ratio={ratio}, replacement={replacement})"
+        )
 
 
 class SolutionAssessor:
@@ -252,8 +494,15 @@ class SolutionAssessor:
 class BaselineComparator:
     """Compares collaborative vs individual solutions with proper statistical tests."""
     
-    def __init__(self, events: list[CollaborativeEvent]) -> None:
+    def __init__(
+        self,
+        events: list[CollaborativeEvent],
+        storage: Optional[JSONStorage] = None,
+        config: Optional[Config] = None,
+    ) -> None:
         self.events = events
+        self.storage = storage
+        self.config = config
     
     def collect_individual_baselines(self) -> pd.DataFrame:
         """Collect baseline individual solution attempts."""
@@ -335,6 +584,158 @@ class BaselineComparator:
         else:
             return 'large'
     
+    @staticmethod
+    def _cohens_d_two_sample(group1: np.ndarray, group2: np.ndarray) -> float:
+        """Compute Cohen's d for two independent samples using pooled SD."""
+        n1, n2 = len(group1), len(group2)
+        if n1 < 2 or n2 < 2:
+            return 0.0
+        var1 = np.var(group1, ddof=1)
+        var2 = np.var(group2, ddof=1)
+        pooled_std = np.sqrt(((n1 - 1) * var1 + (n2 - 1) * var2) / (n1 + n2 - 2))
+        if pooled_std == 0:
+            return 0.0
+        return float((np.mean(group1) - np.mean(group2)) / pooled_std)
+
+    @staticmethod
+    def _bootstrap_cohens_d_ci(
+        group1: np.ndarray,
+        group2: np.ndarray,
+        n_iterations: int = 1000,
+        seed: int = 42,
+    ) -> tuple[float, float]:
+        """Compute 95% bootstrap CI for Cohen's d between two groups.
+
+        Returns (lower, upper) of the 95% percentile interval.
+        """
+        rng = np.random.RandomState(seed)
+        boot_ds: list[float] = []
+        n1, n2 = len(group1), len(group2)
+        for _ in range(n_iterations):
+            s1 = rng.choice(group1, size=n1, replace=True)
+            s2 = rng.choice(group2, size=n2, replace=True)
+            var1 = np.var(s1, ddof=1)
+            var2 = np.var(s2, ddof=1)
+            pooled = np.sqrt(((n1 - 1) * var1 + (n2 - 1) * var2) / (n1 + n2 - 2))
+            if pooled == 0:
+                boot_ds.append(0.0)
+            else:
+                boot_ds.append(float((np.mean(s1) - np.mean(s2)) / pooled))
+        lower = float(np.percentile(boot_ds, 2.5))
+        upper = float(np.percentile(boot_ds, 97.5))
+        return lower, upper
+
+    def compare_quality_with_complexity_matching(self) -> dict:
+        """Compare quality scores using complexity-matched baseline.
+
+        Computes Cohen's d with 95% bootstrap CIs for both unmatched and
+        complexity-matched baselines.  Sets ``flag_for_revision = True`` when
+        |matched_d| < |unmatched_d| × 0.7 (substantial shrinkage).
+
+        Returns:
+            Dict with unmatched_d, matched_d, unmatched_ci, matched_ci,
+            flag_for_revision.
+        """
+        if self.storage is None or self.config is None:
+            return {"result": "missing_storage_or_config"}
+
+        # --- Gather collaborative thread IDs and their quality scores ------
+        collab_thread_ids = []
+        collab_scores_map: dict[str, float] = {}
+        for event in self.events:
+            if event.quality_score is not None:
+                collab_thread_ids.append(event.thread_id)
+                collab_scores_map[event.thread_id] = event.quality_score
+
+        if len(collab_thread_ids) < 2:
+            return {"result": "insufficient_data", "n_collaborative": len(collab_thread_ids)}
+
+        # --- Identify non-collaborative threads ----------------------------
+        all_thread_ids = list(self.storage._posts.keys())
+        collab_set = set(collab_thread_ids)
+        non_collab_ids = [tid for tid in all_thread_ids if tid not in collab_set]
+
+        if len(non_collab_ids) < 2:
+            return {"result": "insufficient_non_collaborative", "n_non_collaborative": len(non_collab_ids)}
+
+        # --- Score non-collaborative threads using SolutionAssessor --------
+        assessor = SolutionAssessor(self.config)
+        non_collab_scores_map: dict[str, float] = {}
+        for tid in non_collab_ids:
+            post_data = self.storage._posts.get(tid)
+            body = post_data.get("body", "") if post_data else ""
+            if body:
+                assessment = assessor.assess_code_solution(body)
+                non_collab_scores_map[tid] = assessment.get("quality_score", 0.0)
+            else:
+                non_collab_scores_map[tid] = 0.0
+
+        # --- Unmatched comparison: collab vs ALL non-collab ----------------
+        collab_scores = np.array([collab_scores_map[tid] for tid in collab_thread_ids])
+        non_collab_scores_all = np.array([non_collab_scores_map[tid] for tid in non_collab_ids])
+
+        seed = self.config.random_seed
+        n_boot = self.config.bootstrap_iterations
+
+        unmatched_d = self._cohens_d_two_sample(collab_scores, non_collab_scores_all)
+        unmatched_ci = self._bootstrap_cohens_d_ci(
+            collab_scores, non_collab_scores_all, n_iterations=n_boot, seed=seed,
+        )
+
+        # --- Complexity-matched comparison ---------------------------------
+        matcher = ComplexityMatcher(self.storage, self.config)
+        matched_df = matcher.match_with_complexity(
+            collab_thread_ids, non_collab_ids, ratio="1:1", replacement=False,
+        )
+
+        if matched_df.empty:
+            return {
+                "result": "matching_failed",
+                "unmatched_d": unmatched_d,
+                "unmatched_ci": list(unmatched_ci),
+            }
+
+        # Build matched non-collab score array aligned with collab scores
+        matched_collab_scores: list[float] = []
+        matched_non_collab_scores: list[float] = []
+        for _, row in matched_df.iterrows():
+            c_tid = row["collaborative_thread"]
+            m_tid = row["matched_thread"]
+            if c_tid in collab_scores_map and m_tid in non_collab_scores_map:
+                matched_collab_scores.append(collab_scores_map[c_tid])
+                matched_non_collab_scores.append(non_collab_scores_map[m_tid])
+
+        matched_collab_arr = np.array(matched_collab_scores)
+        matched_non_collab_arr = np.array(matched_non_collab_scores)
+
+        if len(matched_collab_arr) < 2:
+            return {
+                "result": "insufficient_matched_pairs",
+                "unmatched_d": unmatched_d,
+                "unmatched_ci": list(unmatched_ci),
+            }
+
+        matched_d = self._cohens_d_two_sample(matched_collab_arr, matched_non_collab_arr)
+        matched_ci = self._bootstrap_cohens_d_ci(
+            matched_collab_arr, matched_non_collab_arr, n_iterations=n_boot, seed=seed,
+        )
+
+        # --- Flagging logic ------------------------------------------------
+        flag_for_revision = bool(
+            abs(unmatched_d) > 0 and abs(matched_d) < abs(unmatched_d) * 0.7
+        )
+
+        return {
+            "unmatched_d": unmatched_d,
+            "matched_d": matched_d,
+            "unmatched_ci": list(unmatched_ci),
+            "matched_ci": list(matched_ci),
+            "flag_for_revision": flag_for_revision,
+            "n_collaborative": len(collab_thread_ids),
+            "n_non_collaborative": len(non_collab_ids),
+            "n_matched_pairs": len(matched_collab_arr),
+        }
+
     def permutation_test(self, n_permutations: int = 10000) -> dict:
         """Permutation test for collaboration effect.
         
@@ -803,7 +1204,7 @@ def save_rq3_data(
     saved_files['bootstrap_success'] = str(output_path / 'rq3_bootstrap_success.json')
     
     # 8. Baseline comparison with proper statistical tests
-    comparator = BaselineComparator(events)
+    comparator = BaselineComparator(events, storage=storage, config=config)
     comparison_results = comparator.compare_quality_distributions()
     with open(output_path / 'rq3_baseline_comparison.json', 'w') as f:
         json.dump(convert_numpy_types(comparison_results), f, indent=2)

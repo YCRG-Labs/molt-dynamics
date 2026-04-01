@@ -586,6 +586,189 @@ class DiffusionModeler:
         }
 
 
+    def fit_logistic_model_by_type(self) -> dict[str, dict]:
+        """Run logistic regression adoption model separately per cascade type.
+
+        Groups cascades by ``cascade_type``, then for each type computes
+        exposures and fits a logistic regression with linear + quadratic
+        exposure terms (mirroring :meth:`fit_logistic_model`).
+
+        Returns:
+            Dict keyed by cascade_type with ``beta_linear``, ``beta_quadratic``,
+            ``p_values``, ``pseudo_r2``, and ``contagion_type`` for each.
+            Types with too few cascades or insufficient class diversity report
+            null values gracefully.
+        """
+        from collections import defaultdict as _defaultdict
+
+        # Group cascades by type
+        type_cascades: dict[str, list[Cascade]] = _defaultdict(list)
+        for cascade in self.cascades:
+            type_cascades[cascade.cascade_type].append(cascade)
+
+        results: dict[str, dict] = {}
+
+        for cascade_type, cascades in type_cascades.items():
+            if len(cascades) < 2:
+                logger.warning(
+                    f"Too few cascades for logistic fit on type '{cascade_type}': "
+                    f"{len(cascades)} cascades"
+                )
+                results[cascade_type] = {
+                    'beta_linear': None,
+                    'beta_quadratic': None,
+                    'p_values': None,
+                    'pseudo_r2': None,
+                    'contagion_type': None,
+                    'n_cascades': len(cascades),
+                    'result': 'insufficient_data',
+                }
+                continue
+
+            # Compute exposures for each cascade in this type subset
+            exposure_frames = []
+            for cascade in cascades:
+                exposure_df = self.compute_exposures(cascade)
+                exposure_df['cascade_id'] = cascade.cascade_id
+                exposure_frames.append(exposure_df)
+
+            exposure_frames = [df for df in exposure_frames if not df.empty]
+            if not exposure_frames:
+                results[cascade_type] = {
+                    'beta_linear': None,
+                    'beta_quadratic': None,
+                    'p_values': None,
+                    'pseudo_r2': None,
+                    'contagion_type': None,
+                    'n_cascades': len(cascades),
+                    'result': 'no_exposure_data',
+                }
+                continue
+
+            df = pd.concat(exposure_frames, ignore_index=True)
+
+            X = df[['exposure_count']].copy()
+            X['exposure_squared'] = X['exposure_count'] ** 2
+            y = df['adopted'].astype(int)
+
+            if len(y.unique()) < 2:
+                logger.warning(
+                    f"Insufficient class diversity for type '{cascade_type}'"
+                )
+                results[cascade_type] = {
+                    'beta_linear': None,
+                    'beta_quadratic': None,
+                    'p_values': None,
+                    'pseudo_r2': None,
+                    'contagion_type': None,
+                    'n_cascades': len(cascades),
+                    'n_observations': len(df),
+                    'result': 'insufficient_class_diversity',
+                }
+                continue
+
+            try:
+                import statsmodels.api as sm
+
+                X_arr = X.values
+                X_with_const = np.column_stack([np.ones(len(X_arr)), X_arr])
+                y_arr = y.values
+
+                model = sm.Logit(y_arr, X_with_const)
+                # Use regularization to handle near-perfect separation
+                fit_result = model.fit_regularized(
+                    method='l1', alpha=1e-4, disp=0, trim_mode='off'
+                )
+
+                params = fit_result.params
+                beta_linear = float(params[1])
+                beta_quadratic = float(params[2])
+
+                # For regularized fits we need to get p-values via
+                # the unregularized model if possible; fall back gracefully.
+                try:
+                    unreg_result = model.fit(disp=0, maxiter=300)
+                    pvalues = unreg_result.pvalues
+                    pseudo_r2 = float(unreg_result.prsquared)
+                    p_values_dict = {
+                        'intercept': float(pvalues[0]),
+                        'beta_linear': float(pvalues[1]),
+                        'beta_quadratic': float(pvalues[2]),
+                    }
+                    # Prefer unregularized coefficients when available
+                    beta_linear = float(unreg_result.params[1])
+                    beta_quadratic = float(unreg_result.params[2])
+                except Exception:
+                    p_values_dict = None
+                    pseudo_r2 = None
+
+                contagion_type = (
+                    'saturating' if beta_quadratic < 0 else 'accelerating'
+                )
+
+                results[cascade_type] = {
+                    'beta_linear': beta_linear,
+                    'beta_quadratic': beta_quadratic,
+                    'p_values': p_values_dict,
+                    'pseudo_r2': pseudo_r2,
+                    'contagion_type': contagion_type,
+                    'n_cascades': len(cascades),
+                    'n_observations': len(df),
+                    'n_adopted': int(y.sum()),
+                    'adoption_rate': float(y.mean()),
+                }
+
+                logger.info(
+                    f"Logistic model [{cascade_type}]: "
+                    f"beta_linear={beta_linear:.4f}, "
+                    f"beta_quadratic={beta_quadratic:.4f}, "
+                    f"contagion={contagion_type}"
+                )
+
+            except ImportError:
+                logger.warning(
+                    "statsmodels not available; skipping logistic fit for "
+                    f"type '{cascade_type}'"
+                )
+                results[cascade_type] = {
+                    'beta_linear': None,
+                    'beta_quadratic': None,
+                    'p_values': None,
+                    'pseudo_r2': None,
+                    'contagion_type': None,
+                    'n_cascades': len(cascades),
+                    'result': 'statsmodels_not_installed',
+                }
+            except Exception as e:
+                logger.error(
+                    f"Logistic model fitting failed for type '{cascade_type}': {e}"
+                )
+                results[cascade_type] = {
+                    'beta_linear': None,
+                    'beta_quadratic': None,
+                    'p_values': None,
+                    'pseudo_r2': None,
+                    'contagion_type': None,
+                    'n_cascades': len(cascades),
+                    'result': 'fitting_failed',
+                    'error': str(e),
+                }
+
+        # Write output
+        output_path = Path('output')
+        output_path.mkdir(parents=True, exist_ok=True)
+        with open(output_path / 'rq2_logistic_by_type.json', 'w') as f:
+            json.dump(results, f, indent=2)
+
+        logger.info(
+            f"Logistic by type results written to output/rq2_logistic_by_type.json "
+            f"({len(results)} types)"
+        )
+
+        return results
+
+
+
 class CascadeAnalyzer:
     """Analyzes cascade statistics and distributions."""
     
@@ -742,6 +925,163 @@ class CascadeAnalyzer:
                 'warning': 'Install powerlaw package for rigorous testing',
             }
     
+    def test_power_law_by_type(self) -> dict[str, dict]:
+        """Fit separate power-law distributions for meme and skill cascades.
+
+        Uses the powerlaw package implementing Clauset et al. (2009) methodology
+        for rigorous power-law testing, applied independently to each cascade type.
+
+        Returns:
+            Dict keyed by cascade_type ('meme', 'skill', etc.) with each value
+            containing: alpha, x_min, ks_statistic, lognormal_lr, lognormal_p.
+            Types with insufficient data report null values.
+        """
+        # Group cascades by type
+        type_cascades: dict[str, list[Cascade]] = defaultdict(list)
+        for cascade in self.cascades:
+            type_cascades[cascade.cascade_type].append(cascade)
+
+        results: dict[str, dict] = {}
+
+        for cascade_type, cascades in type_cascades.items():
+            # Compute unique adopter counts per cascade
+            sizes = [len(set(a[0] for a in c.adoptions)) for c in cascades]
+
+            if len(sizes) < 10:
+                logger.warning(
+                    f"Insufficient cascades for power-law fit on type '{cascade_type}': "
+                    f"{len(sizes)} cascades (need >= 10)"
+                )
+                results[cascade_type] = {
+                    'alpha': None,
+                    'x_min': None,
+                    'ks_statistic': None,
+                    'lognormal_lr': None,
+                    'lognormal_p': None,
+                    'n_cascades': len(sizes),
+                    'result': 'insufficient_data',
+                }
+                continue
+
+            sizes_arr = np.array(sizes, dtype=float)
+
+            try:
+                import powerlaw
+
+                fit = powerlaw.Fit(sizes_arr, discrete=True, verbose=False)
+
+                alpha = fit.power_law.alpha
+                xmin = fit.power_law.xmin
+                sigma = fit.power_law.sigma
+
+                # Lognormal comparison
+                R_lognormal, p_lognormal = fit.distribution_compare(
+                    'power_law', 'lognormal'
+                )
+
+                # KS statistic
+                try:
+                    ks_stat = fit.power_law.D
+                except Exception:
+                    ks_stat = None
+
+                results[cascade_type] = {
+                    'alpha': float(alpha),
+                    'x_min': float(xmin),
+                    'ks_statistic': float(ks_stat) if ks_stat is not None else None,
+                    'lognormal_lr': float(R_lognormal),
+                    'lognormal_p': float(p_lognormal),
+                    'alpha_se': float(sigma),
+                    'n_cascades': len(sizes),
+                    'n_above_xmin': int(np.sum(sizes_arr >= xmin)),
+                }
+
+                logger.info(
+                    f"Power-law fit [{cascade_type}]: α={alpha:.3f}±{sigma:.3f}, "
+                    f"xmin={xmin}, KS={ks_stat}, "
+                    f"vs lognormal: R={R_lognormal:.3f}, p={p_lognormal:.4f}"
+                )
+
+            except ImportError:
+                logger.warning(
+                    "powerlaw package not available; skipping fit for "
+                    f"type '{cascade_type}'"
+                )
+                results[cascade_type] = {
+                    'alpha': None,
+                    'x_min': None,
+                    'ks_statistic': None,
+                    'lognormal_lr': None,
+                    'lognormal_p': None,
+                    'n_cascades': len(sizes),
+                    'result': 'powerlaw_not_installed',
+                }
+
+        # Write output
+        output_path = Path('output')
+        output_path.mkdir(parents=True, exist_ok=True)
+        with open(output_path / 'rq2_power_law_by_type.json', 'w') as f:
+            json.dump(results, f, indent=2)
+
+        logger.info(
+            f"Power-law by type results written to output/rq2_power_law_by_type.json "
+            f"({len(results)} types)"
+        )
+
+        return results
+
+    def export_figure6_data(self) -> dict:
+        """Export meme and skill cascade size arrays for two-panel Figure 6.
+
+        Groups cascades by cascade_type, computes cascade sizes (unique adopter
+        counts), and optionally includes power-law fit parameters (alpha, x_min)
+        from :meth:`test_power_law_by_type` when available.
+
+        Writes output to ``output/rq2_figure6_data.json``.
+
+        Returns:
+            Dict keyed by 'meme' and 'skill' with sizes, n_cascades, alpha, x_min.
+        """
+        # Group cascades by type
+        type_cascades: dict[str, list[Cascade]] = defaultdict(list)
+        for cascade in self.cascades:
+            type_cascades[cascade.cascade_type].append(cascade)
+
+        # Try to get power-law fit results
+        power_law_results: dict[str, dict] = {}
+        try:
+            power_law_results = self.test_power_law_by_type()
+        except Exception:
+            logger.warning("Could not obtain power-law fit results for figure 6 data")
+
+        data: dict[str, dict] = {}
+        for ctype in ("meme", "skill"):
+            cascades = type_cascades.get(ctype, [])
+            sizes = sorted(
+                [len(set(a[0] for a in c.adoptions)) for c in cascades],
+                reverse=True,
+            )
+            pl = power_law_results.get(ctype, {})
+            data[ctype] = {
+                "sizes": sizes,
+                "n_cascades": len(sizes),
+                "alpha": pl.get("alpha"),
+                "x_min": pl.get("x_min"),
+            }
+
+        # Write output
+        output_path = Path("output")
+        output_path.mkdir(parents=True, exist_ok=True)
+        with open(output_path / "rq2_figure6_data.json", "w") as f:
+            json.dump(data, f, indent=2)
+
+        logger.info(
+            f"Figure 6 data written to output/rq2_figure6_data.json "
+            f"(meme: {data['meme']['n_cascades']}, skill: {data['skill']['n_cascades']})"
+        )
+
+        return data
+
     def compare_distributions(self) -> dict:
         """Compare cascade size distributions across types.
         
@@ -772,6 +1112,310 @@ class CascadeAnalyzer:
                     }
         
         return results
+
+    def export_figure6_data(self) -> dict:
+        """Export meme and skill cascade size arrays for two-panel Figure 6.
+
+        Groups cascades by cascade_type, computes cascade sizes (unique adopter
+        counts), and optionally includes power-law fit parameters (alpha, x_min)
+        from :meth:`test_power_law_by_type` when available.
+
+        Writes output to ``output/rq2_figure6_data.json``.
+
+        Returns:
+            Dict keyed by 'meme' and 'skill' with sizes, n_cascades, alpha, x_min.
+        """
+        # Group cascades by type
+        type_cascades: dict[str, list[Cascade]] = defaultdict(list)
+        for cascade in self.cascades:
+            type_cascades[cascade.cascade_type].append(cascade)
+
+        # Try to get power-law fit results
+        power_law_results: dict[str, dict] = {}
+        try:
+            power_law_results = self.test_power_law_by_type()
+        except Exception:
+            logger.warning("Could not obtain power-law fit results for figure 6 data")
+
+        data: dict[str, dict] = {}
+        for ctype in ("meme", "skill"):
+            cascades = type_cascades.get(ctype, [])
+            sizes = sorted(
+                [len(set(a[0] for a in c.adoptions)) for c in cascades],
+                reverse=True,
+            )
+            pl = power_law_results.get(ctype, {})
+            data[ctype] = {
+                "sizes": sizes,
+                "n_cascades": len(sizes),
+                "alpha": pl.get("alpha"),
+                "x_min": pl.get("x_min"),
+            }
+
+        # Write output
+        output_path = Path("output")
+        output_path.mkdir(parents=True, exist_ok=True)
+        with open(output_path / "rq2_figure6_data.json", "w") as f:
+            json.dump(data, f, indent=2)
+
+        logger.info(
+            f"Figure 6 data written to output/rq2_figure6_data.json "
+            f"(meme: {data['meme']['n_cascades']}, skill: {data['skill']['n_cascades']})"
+        )
+
+        return data
+
+
+
+class EmbeddingCascadeDetector:
+    """Detects behavioral cascades via sentence-embedding drift.
+
+    Uses a sentence encoder to compute weekly centroid embeddings per submolt,
+    then identifies significant centroid shifts as behavioral cascade events.
+    """
+
+    BATCH_SIZE = 1000
+
+    def __init__(
+        self,
+        storage: JSONStorage,
+        model_name: str = "all-MiniLM-L6-v2",
+    ) -> None:
+        """Initialize embedding cascade detector.
+
+        Args:
+            storage: JSONStorage instance for post data.
+            model_name: Sentence-transformer model name.
+        """
+        self.storage = storage
+        self.model_name = model_name
+        self.detection_failed = False
+        self.methodology_note = ""
+        self._centroids: Optional[pd.DataFrame] = None
+        self._shifts: Optional[list[dict]] = None
+
+        # Lazy import of sentence-transformers
+        try:
+            from sentence_transformers import SentenceTransformer
+            self.encoder = SentenceTransformer(model_name)
+        except ImportError:
+            raise ImportError(
+                "sentence-transformers is required for EmbeddingCascadeDetector. "
+                "Install with: pip install sentence-transformers"
+            )
+
+    def compute_weekly_centroids(self) -> pd.DataFrame:
+        """Compute per-submolt weekly centroid embeddings.
+
+        Groups posts by (submolt, ISO week), encodes post bodies in batches
+        of 1000, and computes the element-wise mean as the centroid.
+
+        Returns:
+            DataFrame with columns: submolt, week, centroid_embedding.
+        """
+        posts = self.storage.get_posts()
+
+        # Build records with submolt, ISO week, and body
+        records: list[dict] = []
+        for post in posts:
+            if post.body and post.created_at and post.submolt:
+                iso_cal = post.created_at.isocalendar()
+                week_key = f"{iso_cal[0]}-W{iso_cal[1]:02d}"
+                records.append({
+                    "submolt": post.submolt,
+                    "week": week_key,
+                    "body": post.body,
+                    "author_id": post.author_id,
+                    "post_id": post.post_id,
+                    "created_at": post.created_at,
+                })
+
+        if not records:
+            self._centroids = pd.DataFrame(
+                columns=["submolt", "week", "centroid_embedding"]
+            )
+            return self._centroids
+
+        df = pd.DataFrame(records)
+
+        centroid_rows: list[dict] = []
+        for (submolt, week), group in df.groupby(["submolt", "week"]):
+            bodies = group["body"].tolist()
+
+            # Encode in batches of BATCH_SIZE to avoid OOM
+            all_embeddings = []
+            for i in range(0, len(bodies), self.BATCH_SIZE):
+                batch = bodies[i : i + self.BATCH_SIZE]
+                embeddings = self.encoder.encode(batch, show_progress_bar=False)
+                all_embeddings.append(np.array(embeddings))
+
+            stacked = np.vstack(all_embeddings)
+            centroid = stacked.mean(axis=0)
+
+            centroid_rows.append({
+                "submolt": submolt,
+                "week": week,
+                "centroid_embedding": centroid,
+            })
+
+        self._centroids = pd.DataFrame(centroid_rows)
+        logger.info(
+            f"Computed {len(centroid_rows)} weekly centroids across "
+            f"{self._centroids['submolt'].nunique()} submolts"
+        )
+        return self._centroids
+
+    def detect_significant_shifts(
+        self, threshold_sd: float = 2.0
+    ) -> list[dict]:
+        """Identify submolts with centroid shifts > threshold_sd standard deviations.
+
+        For each submolt, computes cosine distance between consecutive weekly
+        centroids. A shift is significant if cosine_distance > mean + threshold_sd * SD
+        across all submolt-week pairs.
+
+        Args:
+            threshold_sd: Number of standard deviations above mean for significance.
+
+        Returns:
+            List of dicts with submolt, week_from, week_to, shift_magnitude,
+            seed_agent, seed_post_id.
+        """
+        if self._centroids is None:
+            self.compute_weekly_centroids()
+
+        centroids_df = self._centroids
+        if centroids_df.empty:
+            self._shifts = []
+            return self._shifts
+
+        # Compute all consecutive cosine distances
+        all_shift_records: list[dict] = []
+
+        for submolt, group in centroids_df.groupby("submolt"):
+            group_sorted = group.sort_values("week").reset_index(drop=True)
+            if len(group_sorted) < 2:
+                continue
+
+            for i in range(len(group_sorted) - 1):
+                c1 = group_sorted.iloc[i]["centroid_embedding"]
+                c2 = group_sorted.iloc[i + 1]["centroid_embedding"]
+
+                # Cosine distance = 1 - cosine_similarity
+                dot = np.dot(c1, c2)
+                norm1 = np.linalg.norm(c1)
+                norm2 = np.linalg.norm(c2)
+                if norm1 == 0 or norm2 == 0:
+                    cos_dist = 1.0
+                else:
+                    cos_sim = dot / (norm1 * norm2)
+                    cos_sim = np.clip(cos_sim, -1.0, 1.0)
+                    cos_dist = 1.0 - cos_sim
+
+                all_shift_records.append({
+                    "submolt": submolt,
+                    "week_from": group_sorted.iloc[i]["week"],
+                    "week_to": group_sorted.iloc[i + 1]["week"],
+                    "shift_magnitude": float(cos_dist),
+                })
+
+        if not all_shift_records:
+            self._shifts = []
+            return self._shifts
+
+        # Compute threshold: mean + threshold_sd * SD
+        magnitudes = np.array([r["shift_magnitude"] for r in all_shift_records])
+        mean_shift = float(np.mean(magnitudes))
+        sd_shift = float(np.std(magnitudes))
+        threshold = mean_shift + threshold_sd * sd_shift
+
+        # Identify significant shifts
+        significant: list[dict] = []
+        posts = self.storage.get_posts()
+
+        for record in all_shift_records:
+            if record["shift_magnitude"] > threshold:
+                # Find seed agent: first poster in the target week for this submolt
+                seed_agent = ""
+                seed_post_id = ""
+                week_to = record["week_to"]
+                submolt = record["submolt"]
+
+                for post in posts:
+                    if (
+                        post.submolt == submolt
+                        and post.created_at
+                        and post.body
+                    ):
+                        iso_cal = post.created_at.isocalendar()
+                        post_week = f"{iso_cal[0]}-W{iso_cal[1]:02d}"
+                        if post_week == week_to:
+                            seed_agent = post.author_id
+                            seed_post_id = post.post_id
+                            break
+
+                significant.append({
+                    "submolt": submolt,
+                    "week_from": record["week_from"],
+                    "week_to": record["week_to"],
+                    "shift_magnitude": record["shift_magnitude"],
+                    "seed_agent": seed_agent,
+                    "seed_post_id": seed_post_id,
+                })
+
+        logger.info(
+            f"Detected {len(significant)} significant shifts "
+            f"(threshold={threshold:.4f}, mean={mean_shift:.4f}, sd={sd_shift:.4f})"
+        )
+        self._shifts = significant
+        return self._shifts
+
+    def build_behavioral_cascades(self) -> list[Cascade]:
+        """Convert detected shifts into Cascade objects.
+
+        If fewer than 50 cascades detected, returns empty list and sets
+        self.detection_failed = True with a methodology note.
+
+        Returns:
+            List of Cascade objects with cascade_type='behavioral'.
+        """
+        if self._shifts is None:
+            self.detect_significant_shifts()
+
+        shifts = self._shifts
+        cascades: list[Cascade] = []
+
+        for i, shift in enumerate(shifts):
+            cascade = Cascade(
+                cascade_id=f"emb_behavioral_{i:04d}",
+                cascade_type="behavioral",
+                seed_agent=shift.get("seed_agent", ""),
+                seed_time=datetime.now(),  # placeholder; real time from data
+                adoptions=[],
+                content_hash=f"{shift['submolt']}_{shift['week_from']}_{shift['week_to']}",
+            )
+            cascades.append(cascade)
+
+        if len(cascades) < 50:
+            self.detection_failed = True
+            self.methodology_note = (
+                "Embedding-drift behavioral cascade detection identified fewer than "
+                f"50 cascades ({len(cascades)} detected). Behavioral cascades are "
+                "excluded from quantitative analyses. The regex-based approach "
+                "similarly yielded limited behavioral cascade counts, suggesting "
+                "that behavioral pattern propagation in this dataset operates at "
+                "a granularity not well captured by weekly centroid drift."
+            )
+            logger.warning(
+                f"Behavioral cascade detection failed: only {len(cascades)} cascades "
+                f"detected (minimum 50 required)"
+            )
+            return []
+        else:
+            self.detection_failed = False
+            self.methodology_note = ""
+            logger.info(f"Built {len(cascades)} behavioral cascades from embedding drift")
+            return cascades
 
 
 def verify_cascade_ordering(cascade: Cascade) -> bool:

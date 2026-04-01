@@ -44,6 +44,12 @@ lifelines==0.27.8
 # Power-law testing
 powerlaw==1.5
 
+# Sentence embeddings (behavioral cascade detection)
+sentence-transformers==2.2.2
+
+# Dimensionality reduction (PCA variance expansion)
+umap-learn==0.5.11
+
 # Testing
 pytest==7.4.4
 pytest-cov==4.1.0

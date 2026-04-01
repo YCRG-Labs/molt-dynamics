@@ -212,3 +212,4 @@ __marimo__/
 src/output/
 *.log
 moltbook-observatory-archive/
+/tests/

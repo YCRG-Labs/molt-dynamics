@@ -10,6 +10,7 @@ Performs two complementary analyses:
 
 import json
 import logging
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional
 
@@ -33,6 +34,7 @@ from sklearn.metrics import (
 from sklearn.preprocessing import StandardScaler
 
 from .config import Config
+from .models import HubEmergenceEvent
 
 logger = logging.getLogger(__name__)
 
@@ -953,3 +955,677 @@ class RoleAnalyzer:
         logger.info(f"Saved files to {output_path}")
         
         return all_saved_files
+
+    # ------------------------------------------------------------------
+    # PCA Variance Expansion (P1.3)
+    # ------------------------------------------------------------------
+
+    def compute_scree_data(self) -> dict:
+        """Return per-component variance explained for scree plot.
+
+        Fits PCA on the full (standardised) feature matrix using all
+        available components and returns the explained variance ratio
+        for each component.
+
+        Returns:
+            Dict mapping ``component_index`` (int, 0-based) to
+            ``variance_explained_ratio`` (float).
+        """
+        raw_matrix = self._full_scaler.transform(
+            self.features[self._full_feature_cols].values
+        )
+        n_components = min(len(self._full_feature_cols), len(self.features))
+        pca_full = PCA(n_components=n_components, random_state=self.config.random_seed)
+        pca_full.fit(raw_matrix)
+
+        scree = {
+            int(i): float(v)
+            for i, v in enumerate(pca_full.explained_variance_ratio_)
+        }
+        logger.info(
+            "Scree data: %d components, total variance %.3f",
+            len(scree),
+            sum(scree.values()),
+        )
+        return scree
+
+    def evaluate_component_counts(
+        self, counts: list[int] | None = None
+    ) -> dict:
+        """Compute silhouette at k=3 for each PCA component count.
+
+        For each count in *counts*, fits PCA with that many components,
+        runs K-means with k=3, and records the silhouette score.  Also
+        computes the Adjusted Rand Index (ARI) between the 10-component
+        solution and every higher-component solution.
+
+        Args:
+            counts: List of component counts to evaluate.
+                Defaults to ``[10, 15, 20]``.
+
+        Returns:
+            Dict with ``silhouette_scores`` mapping *n_components* →
+            silhouette, and ``ari_vs_10`` mapping *n_components* → ARI.
+        """
+        if counts is None:
+            counts = [10, 15, 20]
+
+        raw_matrix = self._full_scaler.transform(
+            self.features[self._full_feature_cols].values
+        )
+        max_components = min(len(self._full_feature_cols), len(self.features))
+
+        silhouette_scores: dict[int, float] = {}
+        labels_by_count: dict[int, np.ndarray] = {}
+
+        for n in counts:
+            n_actual = min(n, max_components)
+            pca = PCA(n_components=n_actual, random_state=self.config.random_seed)
+            X_pca = pca.fit_transform(raw_matrix)
+
+            km = KMeans(
+                n_clusters=3,
+                n_init=self.config.kmeans_n_init,
+                random_state=self.config.random_seed,
+            )
+            labels = km.fit_predict(X_pca)
+            sil = silhouette_score(X_pca, labels)
+
+            silhouette_scores[n] = float(sil)
+            labels_by_count[n] = labels
+            logger.info(
+                "Component count %d: silhouette=%.4f", n, sil
+            )
+
+        # ARI vs 10-component solution
+        ari_vs_10: dict[int, float] = {}
+        ref_count = 10
+        if ref_count in labels_by_count:
+            ref_labels = labels_by_count[ref_count]
+            for n, labels in labels_by_count.items():
+                if n != ref_count:
+                    ari = float(adjusted_rand_score(ref_labels, labels))
+                    ari_vs_10[n] = ari
+                    logger.info(
+                        "ARI(%d vs %d) = %.4f", n, ref_count, ari
+                    )
+
+        return {
+            "silhouette_scores": {int(k): v for k, v in silhouette_scores.items()},
+            "ari_vs_10": {int(k): v for k, v in ari_vs_10.items()},
+        }
+
+    def compute_umap_projection(self) -> pd.DataFrame:
+        """UMAP 2D projection of the full feature space.
+
+        Uses ``umap-learn`` (lazy-imported) to project the standardised
+        feature matrix to two dimensions.  Cluster labels come from the
+        current full-feature clustering (falls back to k=3 K-means if
+        clustering has not been run yet).
+
+        Returns:
+            DataFrame with columns ``(agent_id, umap_x, umap_y,
+            cluster_label)``.
+        """
+        try:
+            import umap  # umap-learn
+        except ImportError as exc:
+            raise ImportError(
+                "umap-learn is required for UMAP projection. "
+                "Install it with: pip install umap-learn"
+            ) from exc
+
+        raw_matrix = self._full_scaler.transform(
+            self.features[self._full_feature_cols].values
+        )
+
+        reducer = umap.UMAP(
+            n_components=2,
+            random_state=self.config.random_seed,
+        )
+        embedding = reducer.fit_transform(raw_matrix)
+
+        # Determine cluster labels
+        if self._full_labels is not None:
+            cluster_labels = self._full_labels
+        else:
+            km = KMeans(
+                n_clusters=3,
+                n_init=self.config.kmeans_n_init,
+                random_state=self.config.random_seed,
+            )
+            cluster_labels = km.fit_predict(raw_matrix)
+
+        result = pd.DataFrame({
+            "agent_id": self.features["agent_id"].values,
+            "umap_x": embedding[:, 0],
+            "umap_y": embedding[:, 1],
+            "cluster_label": cluster_labels,
+        })
+
+        logger.info(
+            "UMAP projection: %d agents → 2D", len(result)
+        )
+        return result
+
+
+class TemporalRoleAnalyzer:
+    """Survival analysis for hub emergence using daily network snapshots.
+
+    Builds daily cluster assignments, identifies hub emergence events,
+    computes Cox model covariates, and writes results to CSV.
+    """
+
+    # Clusters considered "hub" roles (Active Contributors, Specialized Connectors)
+    HUB_CLUSTERS = {1, 4}
+
+    def __init__(
+        self,
+        storage: "JSONStorage",
+        network_builder: "NetworkBuilder",
+        feature_extractor: "FeatureExtractor",
+        config: Config,
+    ) -> None:
+        """Initialize temporal role analyzer.
+
+        Args:
+            storage: JSONStorage instance for querying data.
+            network_builder: NetworkBuilder for constructing temporal snapshots.
+            feature_extractor: FeatureExtractor for computing agent features.
+            config: Configuration parameters.
+        """
+        self.storage = storage
+        self.network_builder = network_builder
+        self.feature_extractor = feature_extractor
+        self.config = config
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
+    def build_daily_cluster_assignments(self) -> pd.DataFrame:
+        """For each day, build network snapshot, run K-means, assign clusters.
+
+        Uses ``NetworkBuilder.get_temporal_snapshots()`` with a 1-day interval
+        to obtain daily graphs.  For each snapshot the 5 network-centrality
+        features (in_degree, out_degree, betweenness, clustering_coefficient,
+        pagerank) are computed for every node, standardised, and clustered
+        with K-means (k taken from ``config.kmeans_k_range`` lower bound,
+        default 3).
+
+        Returns:
+            DataFrame with columns ``(agent_id, date, cluster_id)``.
+        """
+        snapshots = self.network_builder.get_temporal_snapshots(
+            interval=timedelta(days=1),
+        )
+
+        if not snapshots:
+            logger.warning("No temporal snapshots available")
+            return pd.DataFrame(columns=["agent_id", "date", "cluster_id"])
+
+        k = self.config.kmeans_k_range[0]
+        rows: list[dict] = []
+
+        for snap_time, graph in snapshots:
+            snap_date = snap_time.date() if isinstance(snap_time, datetime) else snap_time
+            nodes = list(graph.nodes())
+            if len(nodes) < k:
+                # Not enough nodes to cluster – assign all to cluster 0
+                for node in nodes:
+                    rows.append({"agent_id": node, "date": snap_date, "cluster_id": 0})
+                continue
+
+            feature_matrix = self._extract_network_features(graph, nodes)
+
+            # Standardise
+            scaler = StandardScaler()
+            X = scaler.fit_transform(feature_matrix)
+
+            kmeans = KMeans(
+                n_clusters=k,
+                n_init=min(self.config.kmeans_n_init, 10),
+                random_state=self.config.random_seed,
+            )
+            labels = kmeans.fit_predict(X)
+
+            for node, label in zip(nodes, labels):
+                rows.append({"agent_id": node, "date": snap_date, "cluster_id": int(label)})
+
+        df = pd.DataFrame(rows)
+        logger.info(
+            "Built daily cluster assignments: %d rows across %d days",
+            len(df),
+            df["date"].nunique() if len(df) else 0,
+        )
+        return df
+
+    def identify_hub_emergence_events(
+        self,
+        daily_assignments: Optional[pd.DataFrame] = None,
+    ) -> pd.DataFrame:
+        """Find first day each agent enters Cluster 1 or Cluster 4.
+
+        Args:
+            daily_assignments: Output of ``build_daily_cluster_assignments()``.
+                If *None*, it will be computed automatically.
+
+        Returns:
+            DataFrame with columns ``(agent_id, emergence_date, emerged,
+            time_to_emergence_days)``.  Right-censored agents who never
+            emerge get ``emerged=False`` and ``time_to_emergence_days``
+            equal to their total observation time.
+        """
+        if daily_assignments is None:
+            daily_assignments = self.build_daily_cluster_assignments()
+
+        if daily_assignments.empty:
+            return pd.DataFrame(
+                columns=["agent_id", "emergence_date", "emerged", "time_to_emergence_days"]
+            )
+
+        # Ensure date column is comparable
+        daily_assignments = daily_assignments.copy()
+        daily_assignments["date"] = pd.to_datetime(daily_assignments["date"])
+
+        # Per-agent first and last observation dates
+        agent_obs = daily_assignments.groupby("agent_id")["date"].agg(["min", "max"])
+        agent_obs.columns = ["first_date", "last_date"]
+
+        # Filter to hub-cluster rows and find first occurrence per agent
+        hub_rows = daily_assignments[daily_assignments["cluster_id"].isin(self.HUB_CLUSTERS)]
+        if not hub_rows.empty:
+            first_hub = hub_rows.groupby("agent_id")["date"].min().reset_index()
+            first_hub.columns = ["agent_id", "emergence_date"]
+        else:
+            first_hub = pd.DataFrame(columns=["agent_id", "emergence_date"])
+
+        # Build result for every agent
+        records: list[dict] = []
+        for agent_id, obs in agent_obs.iterrows():
+            match = first_hub[first_hub["agent_id"] == agent_id]
+            if not match.empty:
+                emergence_date = match.iloc[0]["emergence_date"]
+                records.append(
+                    {
+                        "agent_id": agent_id,
+                        "emergence_date": emergence_date,
+                        "emerged": True,
+                        "time_to_emergence_days": (emergence_date - obs["first_date"]).days,
+                    }
+                )
+            else:
+                records.append(
+                    {
+                        "agent_id": agent_id,
+                        "emergence_date": None,
+                        "emerged": False,
+                        "time_to_emergence_days": (obs["last_date"] - obs["first_date"]).days,
+                    }
+                )
+
+        result = pd.DataFrame(records)
+        n_emerged = result["emerged"].sum() if len(result) else 0
+        logger.info(
+            "Hub emergence events: %d emerged, %d right-censored",
+            n_emerged,
+            len(result) - n_emerged,
+        )
+        return result
+
+    def compute_covariates(
+        self,
+        hub_events: Optional[pd.DataFrame] = None,
+    ) -> pd.DataFrame:
+        """Compute Cox model covariates for each agent.
+
+        Covariates:
+        - ``join_cohort``: categorical – 'day1-3', 'day4-7', 'later'
+        - ``initial_posting_cadence``: posts/day in first 3 days
+        - ``submolt_diversity_day3``: distinct submolts by day 3
+        - ``early_reply``: received reply within 24 h of first post
+
+        Args:
+            hub_events: Output of ``identify_hub_emergence_events()``.
+                If *None*, it will be computed automatically.
+
+        Returns:
+            DataFrame with hub-event columns plus the four covariates.
+        """
+        if hub_events is None:
+            hub_events = self.identify_hub_emergence_events()
+
+        if hub_events.empty:
+            return hub_events
+
+        posts = self.storage.get_posts()
+        comments = self.storage.get_comments()
+
+        # Build lookup structures
+        posts_by_author: dict[str, list] = {}
+        for p in posts:
+            posts_by_author.setdefault(p.author_id, []).append(p)
+
+        # Determine the global observation start (earliest post)
+        all_post_times = [p.created_at for p in posts if p.created_at]
+        if not all_post_times:
+            # No posts – return hub_events with empty covariates
+            hub_events = hub_events.copy()
+            hub_events["join_cohort"] = "later"
+            hub_events["initial_posting_cadence"] = 0.0
+            hub_events["submolt_diversity_day3"] = 0
+            hub_events["early_reply"] = False
+            return hub_events
+
+        obs_start = min(all_post_times)
+
+        # Build a mapping: post_id -> list of comment timestamps (for early_reply)
+        comments_by_post: dict[str, list[datetime]] = {}
+        for c in comments:
+            if c.created_at:
+                comments_by_post.setdefault(c.post_id, []).append(c.created_at)
+
+        covariates: list[dict] = []
+        for _, row in hub_events.iterrows():
+            agent_id = row["agent_id"]
+            agent_posts = posts_by_author.get(agent_id, [])
+            agent_posts_with_time = [p for p in agent_posts if p.created_at]
+            agent_posts_with_time.sort(key=lambda p: p.created_at)
+
+            # --- join_cohort ---
+            if agent_posts_with_time:
+                first_post_time = agent_posts_with_time[0].created_at
+                days_since_start = (first_post_time - obs_start).days
+            else:
+                days_since_start = 999  # no posts → 'later'
+
+            if days_since_start <= 2:  # day 1-3 (0-indexed days 0,1,2)
+                join_cohort = "day1-3"
+            elif days_since_start <= 6:  # day 4-7
+                join_cohort = "day4-7"
+            else:
+                join_cohort = "later"
+
+            # --- initial_posting_cadence (posts/day in first 3 days) ---
+            if agent_posts_with_time:
+                cutoff = first_post_time + timedelta(days=3)
+                early_posts = [p for p in agent_posts_with_time if p.created_at < cutoff]
+                initial_posting_cadence = len(early_posts) / 3.0
+            else:
+                initial_posting_cadence = 0.0
+
+            # --- submolt_diversity_day3 ---
+            if agent_posts_with_time:
+                cutoff = first_post_time + timedelta(days=3)
+                early_submolts = {
+                    p.submolt for p in agent_posts_with_time
+                    if p.created_at < cutoff and p.submolt
+                }
+                submolt_diversity_day3 = len(early_submolts)
+            else:
+                submolt_diversity_day3 = 0
+
+            # --- early_reply (received reply within 24 h of first post) ---
+            early_reply = False
+            if agent_posts_with_time:
+                first_post = agent_posts_with_time[0]
+                reply_deadline = first_post.created_at + timedelta(hours=24)
+                post_comments = comments_by_post.get(first_post.post_id, [])
+                if any(ct <= reply_deadline for ct in post_comments):
+                    early_reply = True
+
+            covariates.append(
+                {
+                    "agent_id": agent_id,
+                    "join_cohort": join_cohort,
+                    "initial_posting_cadence": initial_posting_cadence,
+                    "submolt_diversity_day3": submolt_diversity_day3,
+                    "early_reply": early_reply,
+                }
+            )
+
+        cov_df = pd.DataFrame(covariates)
+        result = hub_events.merge(cov_df, on="agent_id", how="left")
+        logger.info("Computed covariates for %d agents", len(result))
+        return result
+
+    def fit_cox_model(self) -> dict:
+        """Fit Cox PH model using lifelines.CoxPHFitter.
+
+        Calls :meth:`compute_covariates` to obtain the survival data,
+        encodes ``join_cohort`` as dummy variables (``day1-3`` as reference),
+        fits a Cox proportional-hazards model, and runs the Schoenfeld test
+        for the PH assumption.
+
+        Returns:
+            Dict with ``hazard_ratios``, ``confidence_intervals``,
+            ``concordance_index``, ``log_likelihood``, and
+            ``schoenfeld_test`` results.  Also writes
+            ``output/rq1_cox_hub_model.json``.
+        """
+        from lifelines import CoxPHFitter
+        from lifelines.statistics import proportional_hazard_test
+
+        surv_df = self.compute_covariates()
+
+        if surv_df.empty:
+            logger.warning("No survival data available for Cox model")
+            return {}
+
+        # Prepare modelling DataFrame
+        model_df = surv_df[
+            [
+                "time_to_emergence_days",
+                "emerged",
+                "join_cohort",
+                "initial_posting_cadence",
+                "submolt_diversity_day3",
+                "early_reply",
+            ]
+        ].copy()
+
+        # Encode join_cohort as dummies with day1-3 as reference
+        cohort_dummies = pd.get_dummies(
+            model_df["join_cohort"], prefix="cohort", dtype=float
+        )
+        ref_col = "cohort_day1-3"
+        dummy_cols = [c for c in cohort_dummies.columns if c != ref_col]
+        model_df = pd.concat([model_df, cohort_dummies[dummy_cols]], axis=1)
+        model_df.drop(columns=["join_cohort"], inplace=True)
+
+        # Ensure boolean → float
+        model_df["early_reply"] = model_df["early_reply"].astype(float)
+
+        # Ensure duration > 0 for lifelines (replace 0 with 0.5 day)
+        model_df["time_to_emergence_days"] = model_df[
+            "time_to_emergence_days"
+        ].clip(lower=0.5)
+
+        # Fit Cox PH model (small penalizer for numerical stability)
+        cph = CoxPHFitter(penalizer=0.01)
+        cph.fit(
+            model_df,
+            duration_col="time_to_emergence_days",
+            event_col="emerged",
+        )
+
+        # Extract results
+        summary = cph.summary
+        hazard_ratios = {
+            covar: float(summary.loc[covar, "exp(coef)"])
+            for covar in summary.index
+        }
+        confidence_intervals = {
+            covar: {
+                "lower": float(
+                    summary.loc[covar, "exp(coef) lower 95%"]
+                ),
+                "upper": float(
+                    summary.loc[covar, "exp(coef) upper 95%"]
+                ),
+            }
+            for covar in summary.index
+        }
+        concordance_index = float(cph.concordance_index_)
+        log_likelihood = float(cph.log_likelihood_)
+
+        # Schoenfeld test for PH assumption
+        try:
+            schoenfeld_result = proportional_hazard_test(
+                cph, model_df, time_transform="rank"
+            )
+            schoenfeld_test = {
+                covar: {
+                    "test_statistic": float(
+                        schoenfeld_result.summary.loc[covar, "test_statistic"]
+                    ),
+                    "p_value": float(schoenfeld_result.summary.loc[covar, "p"]),
+                }
+                for covar in schoenfeld_result.summary.index
+            }
+        except Exception as exc:
+            logger.warning("Schoenfeld test failed: %s", exc)
+            schoenfeld_test = {"error": str(exc)}
+
+        result = {
+            "hazard_ratios": hazard_ratios,
+            "confidence_intervals": confidence_intervals,
+            "concordance_index": concordance_index,
+            "log_likelihood": log_likelihood,
+            "schoenfeld_test": schoenfeld_test,
+        }
+
+        # Write output
+        out_path = Path(self.config.output_dir)
+        out_path.mkdir(parents=True, exist_ok=True)
+        with open(out_path / "rq1_cox_hub_model.json", "w") as f:
+            json.dump(result, f, indent=2)
+        logger.info("Wrote Cox model results to %s", out_path / "rq1_cox_hub_model.json")
+
+        return result
+
+    def plot_kaplan_meier(self) -> dict:
+        """Compute KM survival curves stratified by join_cohort.
+
+        Uses ``lifelines.KaplanMeierFitter`` to compute a survival function
+        for each distinct ``join_cohort`` value.
+
+        Returns:
+            Dict with survival function data points per cohort, suitable
+            for TikZ rendering.  Also writes ``output/rq1_km_curves.json``.
+        """
+        from lifelines import KaplanMeierFitter
+
+        surv_df = self.compute_covariates()
+
+        if surv_df.empty:
+            logger.warning("No survival data available for KM curves")
+            return {}
+
+        cohorts = sorted(surv_df["join_cohort"].unique())
+        curves: dict[str, dict] = {}
+
+        for cohort in cohorts:
+            mask = surv_df["join_cohort"] == cohort
+            subset = surv_df[mask]
+
+            durations = subset["time_to_emergence_days"].clip(lower=0.5)
+            events = subset["emerged"].astype(int)
+
+            kmf = KaplanMeierFitter()
+            kmf.fit(durations, event_observed=events, label=cohort)
+
+            sf = kmf.survival_function_
+            curves[cohort] = {
+                "timeline": [float(t) for t in sf.index.tolist()],
+                "survival_probability": [
+                    float(v) for v in sf.iloc[:, 0].tolist()
+                ],
+                "n_subjects": int(len(subset)),
+                "n_events": int(events.sum()),
+            }
+
+        result = {"cohorts": curves, "n_cohorts": len(cohorts)}
+
+        # Write output
+        out_path = Path(self.config.output_dir)
+        out_path.mkdir(parents=True, exist_ok=True)
+        with open(out_path / "rq1_km_curves.json", "w") as f:
+            json.dump(result, f, indent=2)
+        logger.info("Wrote KM curves to %s", out_path / "rq1_km_curves.json")
+
+        return result
+
+    def run_and_save(self, output_dir: Optional[str] = None) -> pd.DataFrame:
+        """Run the full temporal role analysis and write results to CSV.
+
+        Args:
+            output_dir: Directory to write ``rq1_hub_emergence.csv``.
+                Defaults to ``config.output_dir``.
+
+        Returns:
+            The final DataFrame written to disk.
+        """
+        daily = self.build_daily_cluster_assignments()
+        hub_events = self.identify_hub_emergence_events(daily)
+        result = self.compute_covariates(hub_events)
+
+        out_path = Path(output_dir or self.config.output_dir)
+        out_path.mkdir(parents=True, exist_ok=True)
+        csv_path = out_path / "rq1_hub_emergence.csv"
+        result.to_csv(csv_path, index=False)
+        logger.info("Wrote hub emergence data to %s", csv_path)
+        return result
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _extract_network_features(
+        graph: "nx.DiGraph | nx.Graph",
+        nodes: list[str],
+    ) -> np.ndarray:
+        """Compute the 5 network-centrality features for *nodes* in *graph*.
+
+        Returns an (N, 5) array with columns:
+        ``[in_degree, out_degree, betweenness, clustering_coefficient, pagerank]``.
+        """
+        import networkx as nx
+
+        is_directed = isinstance(graph, nx.DiGraph)
+
+        # Degree
+        if is_directed:
+            in_deg = dict(graph.in_degree(nodes))
+            out_deg = dict(graph.out_degree(nodes))
+        else:
+            deg = dict(graph.degree(nodes))
+            in_deg = deg
+            out_deg = deg
+
+        # Betweenness (computed on full graph, then sliced)
+        betweenness = nx.betweenness_centrality(graph)
+
+        # Clustering coefficient (needs undirected)
+        undirected = graph.to_undirected() if is_directed else graph
+        clustering = nx.clustering(undirected)
+
+        # PageRank
+        try:
+            pagerank = nx.pagerank(graph, alpha=0.85)
+        except nx.PowerIterationFailedConvergence:
+            pagerank = {n: 1.0 / len(graph) for n in graph.nodes()}
+
+        rows = []
+        for n in nodes:
+            rows.append(
+                [
+                    in_deg.get(n, 0),
+                    out_deg.get(n, 0),
+                    betweenness.get(n, 0.0),
+                    clustering.get(n, 0.0),
+                    pagerank.get(n, 0.0),
+                ]
+            )
+        return np.array(rows, dtype=float)

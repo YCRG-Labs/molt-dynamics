@@ -11,9 +11,11 @@ from .storage import JSONStorage, anonymize_agent_id
 from .dataset_loader import MoltBookDatasetLoader
 from .network import NetworkBuilder
 from .features import FeatureExtractor, TopicModeler
-from .rq1_roles import RoleAnalyzer
-from .rq2_diffusion import CascadeIdentifier, DiffusionModeler, CascadeAnalyzer
+from .rq1_roles import RoleAnalyzer, TemporalRoleAnalyzer
+from .rq2_diffusion import CascadeIdentifier, DiffusionModeler, CascadeAnalyzer, EmbeddingCascadeDetector
 from .rq3_collaboration import CollaborationIdentifier, SolutionAssessor
+from .qualitative_events import CascadeTracer
+from .sensitivity import CoxSampleSensitivity, IncidentSensitivity
 from .validation import StatisticalFramework, RobustnessChecker
 from .output import OutputGenerator
 
@@ -26,11 +28,16 @@ __all__ = [
     'FeatureExtractor',
     'TopicModeler',
     'RoleAnalyzer',
+    'TemporalRoleAnalyzer',
     'CascadeIdentifier',
     'DiffusionModeler',
     'CascadeAnalyzer',
+    'EmbeddingCascadeDetector',
     'CollaborationIdentifier',
     'SolutionAssessor',
+    'CascadeTracer',
+    'CoxSampleSensitivity',
+    'IncidentSensitivity',
     'StatisticalFramework',
     'RobustnessChecker',
     'OutputGenerator',
