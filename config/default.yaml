@@ -10,8 +10,8 @@ pagerank_damping: 0.85
 bootstrap_iterations: 1000
 significance_level: 0.05
 
-# Parallelization (-1 = use all CPUs)
-n_jobs: -1
+# Parallelization (-1 = use all CPUs, reduce if hitting memory limits)
+n_jobs: 24
 
 # Cascade identification
 min_cascade_adopters: 5
