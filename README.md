@@ -1,6 +1,6 @@
 Code Associated With:
 
-## Molt Dynamics: Emergent Social Phenomena in Large-Scale Autonomous AI Agent Networks
+## Benchmarking Emergent Coordination in Large-Scale LLM Populations: An Evaluation Framework on the MoltBook Archive
 
 ## Dataset
 
