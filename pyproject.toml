@@ -11,7 +11,6 @@ license = {text = "MIT"}
 requires-python = ">=3.11"
 authors = [
     {name = "Brandon Yee", email = "b.yee@ycrg-labs.org"},
-    {name = "Krishna Sharma", email = "ksharma3@stanford.edu"}
 ]
 keywords = ["ai-agents", "network-analysis", "emergent-behavior", "moltbook"]
 classifiers = [
