@@ -1,32 +1,3 @@
-"""Validity-first rigor pipeline for the MoltBook analysis (CAISc 2026).
-
-FAST standalone re-analysis. Reads the Observatory parquet directly with
-polars (predicate pushdown + streaming), builds the interaction graph with
-igraph (C core), and parallelizes the null models with joblib.
-
-Produces the rigorous numbers the paper needs:
-
-  Task 1  structural roles + DEGREE-PRESERVING NULL MODELS (igraph config model)
-  Task 2  cascades (size = distinct adopters) + HONEST Clauset power-law verdict
-          + a label-shuffle null on the cascade-size Gini
-  Task 3  a REAL matched single-agent baseline (the paper's d=-0.88 has no
-          generating code) with the paper's biased metric AND a
-          collaboration-neutral metric
-  Autonomy  per-agent CoV heartbeat filter + threshold sweep + autonomous-only
-          re-run of every task
-  FDR     Benjamini-Hochberg across the reported p-value family
-
-GPU (optional, Brev): wrap with `python -m cudf.pandas scripts/run_rigor.py ...`
-and/or `NX_CUGRAPH_AUTOCONFIG=True`. Not required; the polars+igraph CPU path is
-already minutes, not hours.
-
-Usage:
-    python scripts/run_rigor.py --data-dir moltbook-observatory-archive/data \
-        --start 2026-01-28 --end 2026-02-20 --out results/rigor_results.json
-Smoke first:
-    python scripts/run_rigor.py --data-dir ... --smoke 60000 --out results/smoke.json
-"""
-
 from __future__ import annotations
 
 import argparse
@@ -56,10 +27,8 @@ TECHNICAL_KEYWORDS = [
 _KW_RE = re.compile("|".join(re.escape(k) for k in TECHNICAL_KEYWORDS))
 
 
-# --------------------------------------------------------------------------- #
 def _ca_naive_expr(dtype):
-    """created_at -> tz-naive Datetime[us], whether stored as string or datetime
-    (files mix us/ns precision and tz, so normalize before any concat)."""
+
     if dtype == pl.String:
         return (pl.col("created_at")
                 .str.to_datetime(strict=False, time_unit="us", time_zone="UTC")
@@ -365,9 +334,6 @@ def task3(posts, comments):
     return res
 
 
-# --------------------------------------------------------------------------- #
-# (5) power-law goodness-of-fit: Clauset bootstrap KS p-value
-# --------------------------------------------------------------------------- #
 def _pl_gof_p(sizes, fit, n_iter, rng):
     import powerlaw
     sizes = np.asarray(sizes)
@@ -392,9 +358,6 @@ def _pl_gof_p(sizes, fit, n_iter, rng):
                                else "power-law REJECTED (p<0.1)" if done else "gof_failed")}
 
 
-# --------------------------------------------------------------------------- #
-# (5) cascade-definition robustness: verbatim vs MinHash near-dup vs n-gram
-# --------------------------------------------------------------------------- #
 def cascades_minhash(posts, threshold=0.8, num_perm=32, max_posts=150000):
     try:
         from datasketch import MinHash, MinHashLSH
@@ -446,15 +409,12 @@ def cascade_robustness(posts, gof_iters):
     casc, _ = _cascade_sizes(posts)
     sizes = casc["n_agents"].to_numpy()
     out["verbatim"] = {"n_cascades": int(len(sizes)), "sizes_summary": _summ(sizes),
-                       "powerlaw": _safe(lambda: powerlaw_report(sizes, 0))}  # GOF already in task2
+                       "powerlaw": _safe(lambda: powerlaw_report(sizes, 0))}
     out["minhash_neardup"] = _safe(lambda: cascades_minhash(posts))
     out["ngram_sampled"] = _safe(lambda: cascades_ngram(posts))
     return out
 
 
-# --------------------------------------------------------------------------- #
-# (1) contagion + survival with the susceptible-depletion discriminator
-# --------------------------------------------------------------------------- #
 def _cascade_adoptions(posts, min_adopters, max_cascades):
     p = (posts.select(["agent_id", "content", "created_at"]).drop_nulls()
          .with_columns(pl.col("content").str.to_lowercase().str.replace_all(r"\s+", " ").str.strip_chars().alias("norm"))
@@ -501,7 +461,7 @@ def task2_contagion(posts, min_adopters=8, max_cascades=800, null_iter=20):
         _, hr_e, p_e = _cox_expo(early)
         res["cox_early_cohort"] = {"hazard_ratio": hr_e, "p_clustered": p_e,
                                    "reading": "if HR -> 1 vs full, the saturation is susceptible depletion not behavior"}
-    # Poisson-null discriminator: random uniform adoption times per cascade
+
     import pandas as pd
     rng = np.random.RandomState(SEED)
     fad = fa.to_pandas(); null_hrs = []
@@ -529,9 +489,6 @@ def task2_contagion(posts, min_adopters=8, max_cascades=800, null_iter=20):
     return res
 
 
-# --------------------------------------------------------------------------- #
-# (2) Leiden communities + modularity-vs-null
-# --------------------------------------------------------------------------- #
 def task1_leiden(g, n_null=20):
     from sklearn.metrics import adjusted_rand_score
     from sklearn.cluster import KMeans
@@ -570,9 +527,6 @@ def task1_leiden(g, n_null=20):
     return out
 
 
-# --------------------------------------------------------------------------- #
-# (3) autonomous vs human-steered structural contrast
-# --------------------------------------------------------------------------- #
 def autonomy_split(posts, comments, autonomous, human):
     def block(ids):
         ap = posts.filter(pl.col("agent_id").is_in(ids))
@@ -587,9 +541,6 @@ def autonomy_split(posts, comments, autonomous, human):
             "reading": "if reciprocity/cascades concentrate in human-steered accounts, the 'coordination' is not autonomous"}
 
 
-# --------------------------------------------------------------------------- #
-# (6) Holtz reconciliation: comment-level no-reply periphery
-# --------------------------------------------------------------------------- #
 def comment_level_periphery(posts, comments):
     referenced = set(comments.select("parent_id").drop_nulls()["parent_id"].to_list())
     cids = comments["id"].to_list()
@@ -602,12 +553,8 @@ def comment_level_periphery(posts, comments):
                        "both correct under different denominators"}
 
 
-# --------------------------------------------------------------------------- #
-# (7) periodicity / heartbeat cross-check for the autonomy filter
-# --------------------------------------------------------------------------- #
 def periodicity_autonomy(posts, comments, cov_df, cov_threshold, sample=4000, dt_h=0.25):
-    """Binned-count periodogram of each agent's activity; dominant period in
-    [0.5h, 24h] and its prominence. Cross-checks the CoV autonomy filter."""
+
     from scipy.signal import periodogram
     import pandas as pd
     ev = (pl.concat([posts.select(["agent_id", "created_at"]), comments.select(["agent_id", "created_at"])])
@@ -646,9 +593,6 @@ def periodicity_autonomy(posts, comments, cov_df, cov_threshold, sample=4000, dt
             "reading": "concurrent validity: do CoV-low (autonomous) agents also show strong periodicity?"}
 
 
-# --------------------------------------------------------------------------- #
-# (8) bootstrap CI helper
-# --------------------------------------------------------------------------- #
 def _boot_ci(fn, *arrays, n_boot=2000, rng=None):
     rng = rng or np.random.RandomState(SEED)
     vals = []
@@ -759,26 +703,26 @@ def main():
     except Exception as e:
         log.warning("autonomy summary failed: %s", e)
 
-    # Task 1: structure, nulls, clusters, Leiden communities
+
     R["task1"] = _stage("task1", lambda: task1(g))
     R["task1_nulls"] = _stage("task1_nulls", lambda: task1_nulls(g, args.null_iters, args.n_jobs))
     R["task1_clusters"] = _stage("task1_clusters", lambda: task1_clusters(g))
-    R["task1_leiden"] = _stage("task1_leiden", lambda: task1_leiden(g))                       # (2)
-    R["comment_level_periphery"] = _stage("holtz_reconcile", lambda: comment_level_periphery(posts, comments))  # (6)
+    R["task1_leiden"] = _stage("task1_leiden", lambda: task1_leiden(g))
+    R["comment_level_periphery"] = _stage("holtz_reconcile", lambda: comment_level_periphery(posts, comments))
 
-    # Task 2: cascades + honest power-law (Clauset GOF) + contagion/depletion
+
     R["task2"] = _stage("task2", lambda: task2(posts, args.shuffle_iters, args.gof_iters))
-    R["task2_contagion"] = _stage("task2_contagion", lambda: task2_contagion(posts, max_cascades=args.contagion_cascades))  # (1)
-    R["cascade_robustness"] = _stage("cascade_robustness", lambda: cascade_robustness(posts, args.gof_iters))   # (5)
+    R["task2_contagion"] = _stage("task2_contagion", lambda: task2_contagion(posts, max_cascades=args.contagion_cascades))
+    R["cascade_robustness"] = _stage("cascade_robustness", lambda: cascade_robustness(posts, args.gof_iters))
 
-    # Task 3: matched baseline + bootstrap CIs (8)
+
     R["task3"] = _stage("task3", lambda: task3(posts, comments))
 
-    # (3) autonomous vs human-steered structural contrast
+
     if autonomous and human:
         R["autonomy_split"] = _stage("autonomy_split", lambda: autonomy_split(posts, comments, autonomous, human))
 
-    # (7) periodicity cross-check of the autonomy filter
+
     if hasattr(cov, "empty") and not cov.empty:
         R["periodicity"] = _stage("periodicity", lambda: periodicity_autonomy(posts, comments, cov, args.cov_threshold))
 
