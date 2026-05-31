@@ -38,6 +38,11 @@ python-dotenv==1.0.0
 # Topic modeling
 gensim==4.3.2
 
+# Fast rigor pipeline (scripts/run_rigor.py): vectorized load + C-core graph + parallel nulls
+polars>=1.0
+igraph>=0.11
+joblib>=1.3
+
 # Survival analysis
 lifelines==0.27.8
 
